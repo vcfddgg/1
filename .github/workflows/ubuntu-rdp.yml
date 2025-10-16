@@ -1,0 +1,124 @@
+name: Ubuntu RDP 6-Hour Stable
+
+on:
+  workflow_dispatch:
+    inputs:
+      ts_authkey:
+        description: "Tailscale Auth Key (optional)"
+        required: false
+        default: ""
+      crd_code:
+        description: "Optional Chrome Remote Desktop code (--code=\"4/...\" or full command)"
+        required: false
+        default: ""
+      crd_pin:
+        description: "CRD PIN (6–12 digits)"
+        required: false
+        default: "123456"
+      ngrok:
+        description: "Optional Ngrok Token or Token,region (us,in,eu,ap,au,sa,jp)"
+        required: false
+        default: ""
+
+jobs:
+  ubuntu_rdp:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 370
+    env:
+      USERNAME: Bullettemporary
+      PASSWORD: Bullet@12345
+      RUNTIME_MINUTES: 355
+
+    steps:
+      - name: 🧩 Prepare System & User
+        shell: bash
+        run: |
+          set -e
+          sudo apt update
+          sudo apt install -y xfce4 xfce4-goodies xorg xrdp xfconf dbus-x11 x11-xserver-utils curl jq unzip
+          
+          # Create user
+          if ! id -u "$USERNAME" >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash "$USERNAME"
+          fi
+          echo "$USERNAME:$PASSWORD" | sudo chpasswd
+          echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/$USERNAME >/dev/null
+          
+          # Fix XFCE failsafe-session
+          sudo systemctl enable dbus
+          sudo systemctl start dbus
+          echo "XDG_CONFIG_DIRS=/etc/xdg:/etc" | sudo tee -a /etc/environment >/dev/null
+          sudo -u "$USERNAME" touch /home/$USERNAME/.Xauthority
+          sudo chown "$USERNAME:$USERNAME" /home/$USERNAME/.Xauthority
+          
+          # Replace startwm.sh
+          sudo bash -c 'cat > /etc/xrdp/startwm.sh <<EOF
+          #!/bin/sh
+          export XDG_CONFIG_DIRS=/etc/xdg:/etc
+          export DESKTOP_SESSION=xfce
+          export XDG_CURRENT_DESKTOP=XFCE
+          unset DBUS_SESSION_BUS_ADDRESS
+          exec startxfce4
+          EOF'
+          sudo chmod +x /etc/xrdp/startwm.sh
+          
+          # Enable XRDP
+          sudo adduser xrdp ssl-cert || true
+          sudo systemctl enable xrdp
+          sudo systemctl restart xrdp xrdp-sesman
+          
+          echo "✅ XRDP ready: User=$USERNAME  Pass=$PASSWORD  Port=3389"
+
+      - name: 🌐 Optional - Start Tailscale
+        if: ${{ inputs.ts_authkey != '' }}
+        shell: bash
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --authkey "${{ inputs.ts_authkey }}" --hostname "bullet-ubuntu" --accept-dns=true --accept-routes=true
+          TSIP=$(tailscale ip -4 | head -n1)
+          echo "Tailscale IP: $TSIP"
+
+      - name: 💻 Optional - Chrome Remote Desktop
+        if: ${{ inputs.crd_code != '' }}
+        shell: bash
+        run: |
+          set -e
+          DEB=/tmp/crd.deb
+          curl -fsSL -o "$DEB" https://dl.google.com/linux/direct/chrome-remote-desktop_current_amd64.deb
+          sudo dpkg -i "$DEB" || sudo apt -f install -y
+          CODE_RAW="${{ inputs.crd_code }}"
+          PIN="${{ inputs.crd_pin }}"
+          [[ "$PIN" =~ ^[0-9]{6,12}$ ]] || { echo "Invalid CRD PIN"; exit 1; }
+          CODE=$(echo "$CODE_RAW" | grep -o '4/[^"]*' | head -n1)
+          [[ -z "$CODE" ]] && { echo "No CRD code detected"; exit 1; }
+          sudo -u "$USERNAME" /opt/google/chrome-remote-desktop/start-host \
+            --code="$CODE" --redirect-url="https://remotedesktop.google.com/_/oauthredirect" \
+            --name="Ubuntu-RDP" --pin="$PIN"
+          sudo systemctl enable chrome-remote-desktop@$USERNAME
+          sudo systemctl restart chrome-remote-desktop@$USERNAME
+          echo "✅ CRD running."
+
+      - name: ⚙️ Optional - Ngrok Tunnel (Port 3389)
+        if: ${{ inputs.ngrok != '' }}
+        shell: bash
+        run: |
+          RAW="${{ inputs.ngrok }}"
+          TOK=$(echo "$RAW" | cut -d',' -f1)
+          REG=$(echo "$RAW" | cut -d',' -f2)
+          [ -z "$REG" ] && REG="in"
+          curl -sSL -o ng.zip https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-stable-linux-amd64.zip
+          unzip -o ng.zip
+          ./ngrok authtoken "$TOK"
+          nohup ./ngrok tcp 3389 --region "$REG" >/tmp/ngrok.log 2>&1 &
+          sleep 8
+          echo "Ngrok URL:"
+          curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[]?.public_url'
+
+      - name: 🕒 Keep Alive for 6 Hours
+        shell: bash
+        run: |
+          END=$(( $(date +%s) + 60 * $RUNTIME_MINUTES ))
+          while [ $(date +%s) -lt $END ]; do
+            echo "💚 Ubuntu RDP Live | $(date +%T)"
+            sleep 60
+          done
