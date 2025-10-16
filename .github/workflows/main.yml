@@ -1,93 +1,30 @@
-name: RDP + Tailscale + Avica + CRD + Ngrok
-on:
-  workflow_dispatch:
-    inputs:
-      os_image:
-        description: "OS (windows or ubuntu)"
-        required: true
-        default: "windows"
-      ts_tailnet:  { description: "Tailnet", required: true }
-      ts_api_key:  { description: "Tailscale API key", required: true }
-      ts_authkey:  { description: "Tailscale Auth key", required: true }
-      runtime_minutes: { description: "Run time (5–360)", required: false, default: "355" }
-      crd_code:    { description: "Chrome Remote Desktop code", required: false, default: "" }
-      crd_pin:     { description: "PIN", required: false, default: "123456" }
-      ngrok:       { description: "Ngrok token or token,region", required: false, default: "" }
-
-permissions:
-  contents: read
-  actions: write
-
-jobs:
-  build:
-    runs-on: ${{ inputs.os_image == 'windows' && 'windows-latest' || 'ubuntu-24.04' }}
-    timeout-minutes: 360
-    steps:
-      - name: Set variables
-        shell: bash
-        run: |
-          echo "RUNTIME_MINUTES=${{ inputs.runtime_minutes }}" >> $GITHUB_ENV
-          echo "CRD_ENABLED=${{ inputs.crd_code != '' && '1' || '0' }}" >> $GITHUB_ENV
-
-      - name: Install Tailscale
-        run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
-          sudo tailscale up --authkey "${{ inputs.ts_authkey }}" --hostname "bullet" --accept-dns=true --accept-routes=true
-
-      - name: (Windows) Setup Chrome Remote Desktop
-        if: ${{ runner.os == 'Windows' && env.CRD_ENABLED == '1' }}
-        shell: pwsh
-        run: |
-          $msi="$env:TEMP\crdhost.msi"
-          Invoke-WebRequest -Uri "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi" -OutFile $msi
-          Start-Process msiexec.exe -ArgumentList "/i","`"$msi`"","/quiet","/norestart" -Wait
-          $code="${{ inputs.crd_code }}"
-          $pin="${{ inputs.crd_pin }}"
-          if ($code -and $pin) {
-            Start-Process "$env:ProgramFiles(x86)\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe" `
-              -ArgumentList "--code=$code","--redirect-url=https://remotedesktop.google.com/_/oauthredirect","--name=$env:COMPUTERNAME","--pin=$pin"
-          }
-
-      - name: (Windows) Install & Run Avica
-        if: ${{ runner.os == 'Windows' }}
-        shell: pwsh
-        run: |
-          $dl="$env:TEMP\Downloads.bat"
-          Invoke-WebRequest -Uri "https://gitlab.com/gusta7w7/pcrdp-avica/-/raw/main/Downloads.bat" -OutFile $dl
-          & $dl
-
-      - name: (Ubuntu) Setup XRDP + Avica
+- name: (Ubuntu) Setup Desktop + XRDP (no Avica)
         if: ${{ runner.os == 'Linux' }}
         shell: bash
         run: |
+          set -e
           sudo apt-get update
-          sudo apt-get install -y xfce4 xfce4-goodies xrdp curl
+          sudo apt-get install -y xfce4 xfce4-goodies xorg dbus-x11 xrdp curl jq unzip
+          sudo apt-get install -y xfconf
+          
+          # Create user + password
           sudo useradd -m -s /bin/bash Bullettemporary || true
           echo "Bullettemporary:Bullet@12345" | sudo chpasswd
-          echo "xfce4-session" | sudo tee /home/Bullettemporary/.xsession
+          echo "Bullettemporary ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/bullettemporary
+          
+          # Fix XFCE black screen / failsafe session
+          sudo systemctl enable dbus
+          sudo systemctl start dbus
+          echo "export XDG_CONFIG_DIRS=/etc/xdg:/etc" | sudo tee -a /etc/environment
+          echo "startxfce4" | sudo tee /home/Bullettemporary/.xsession
+          sudo chown Bullettemporary:Bullettemporary /home/Bullettemporary/.xsession
+          
+          # Force xrdp to start xfce
+          sudo sed -i '/^test -x.*startwm.sh/s/^/#/' /etc/xrdp/startwm.sh
+          echo "xfce4-session" | sudo tee -a /etc/xrdp/startwm.sh
+          
+          # Enable XRDP
           sudo systemctl enable xrdp
           sudo systemctl restart xrdp
-          curl -fsSL -o /tmp/Downloads.bat https://gitlab.com/gusta7w7/pcrdp-avica/-/raw/main/Linux.sh || true
-          sudo bash /tmp/Downloads.bat || true
-
-      - name: Ngrok TCP (optional)
-        if: ${{ inputs.ngrok != '' }}
-        shell: bash
-        run: |
-          IFS=',|' read -r TOKEN REGION <<< "${{ inputs.ngrok }}"
-          [ -z "$REGION" ] && REGION="in"
-          curl -sSL -o ng.zip https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-stable-${{ runner.os == 'Windows' && 'windows' || 'linux' }}-amd64.zip
-          unzip -o ng.zip
-          ./ngrok authtoken "$TOKEN"
-          nohup ./ngrok tcp 3389 --region "$REGION" >/tmp/ngrok.log 2>&1 &
-          sleep 8
-          curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[]?.public_url' || true
-
-      - name: Keep alive
-        shell: bash
-        run: |
-          end=$(( $(date +%s) + 60*${RUNTIME_MINUTES:-355} ))
-          while [ $(date +%s) -lt $end ]; do
-            echo "Running... $(date)"
-            sleep 60
-          done
+          
+          echo "✅ Ubuntu XFCE Desktop + XRDP ready."
