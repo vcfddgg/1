@@ -1,10 +1,10 @@
-name: Ubuntu RDP + Tailscale (+ optional CRD, Ngrok)
+name: Ubuntu XRDP Fixed (No Avica)
 
 on:
   workflow_dispatch:
     inputs:
       ts_authkey:
-        description: "Tailscale Auth key (reusable or ephemeral)"
+        description: "Tailscale Auth key"
         required: true
       runtime_minutes:
         description: "Runtime minutes (5–360; default 355)"
@@ -25,9 +25,8 @@ on:
 
 jobs:
   ubuntu_rdp:
-    runs-on: ubuntu-latest   # use ubuntu-24.04 if you specifically want that image
+    runs-on: ubuntu-24.04
     timeout-minutes: 370
-
     env:
       LNX_USER: Bullettemporary
       LNX_PASS: Bullet@12345
@@ -37,13 +36,12 @@ jobs:
       - name: Decide runtime + flags
         shell: bash
         run: |
-          RT="${{ inputs.runtime_minutes }}"
-          [[ -z "$RT" || "$RT" -lt 5 || "$RT" -gt 360 ]] && RT=355
+          RT="${{ inputs.runtime_minutes }}"; [[ -z "$RT" || "$RT" -lt 5 || "$RT" -gt 360 ]] && RT=355
           echo "RUNTIME_MINUTES=$RT" >> "$GITHUB_ENV"
-          if [[ -n "${CRD_CODE_RAW}" ]]; then echo "CRD_ENABLED=1" >> "$GITHUB_ENV"; else echo "CRD_ENABLED=0" >> "$GITHUB_ENV"; fi
+          [[ -n "${CRD_CODE_RAW}" ]] && echo "CRD_ENABLED=1" >> "$GITHUB_ENV" || echo "CRD_ENABLED=0" >> "$GITHUB_ENV"
           echo "TS_HOSTNAME=bullet" >> "$GITHUB_ENV"
 
-      - name: Install Desktop + XRDP (black-screen/failsafe fixed)
+      - name: Install XFCE + XRDP (with failsafe-session fix)
         shell: bash
         run: |
           set -e
@@ -51,31 +49,45 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             xfce4 xfce4-goodies xrdp xorgxrdp xfconf dbus-x11 x11-xserver-utils curl unzip jq ca-certificates
 
-          # Create user (case-sensitive) and set password
+          # Create RDP user
           if ! id -u "$LNX_USER" >/dev/null 2>&1; then sudo useradd -m -s /bin/bash "$LNX_USER"; fi
           echo "$LNX_USER:$LNX_PASS" | sudo chpasswd
           echo "$LNX_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/$LNX_USER
 
-          # Ensure D-Bus and proper XDG config so xfconfd works (avoids failsafe session)
+          # Ensure D-Bus and XDG path
           sudo systemctl enable dbus
           sudo systemctl start dbus
-          echo "export XDG_CONFIG_DIRS=/etc/xdg:/etc" | sudo tee -a /etc/environment
+          grep -q '^XDG_CONFIG_DIRS=' /etc/environment || echo 'XDG_CONFIG_DIRS=/etc/xdg:/etc' | sudo tee -a /etc/environment >/dev/null
 
-          # Force XFCE for XRDP sessions
+          # Make sure .Xauthority exists & owned
+          sudo -u "$LNX_USER" touch "/home/$LNX_USER/.Xauthority"
+          sudo chown "$LNX_USER:$LNX_USER" "/home/$LNX_USER/.Xauthority"
+
+          # Force XFCE for all XRDP sessions via a minimal startwm.sh
+          sudo bash -c 'cat >/etc/xrdp/startwm.sh << "EOF"
+#!/bin/sh
+# Minimal, reliable XRDP start script for XFCE
+export XDG_CONFIG_DIRS=/etc/xdg:/etc
+export DESKTOP_SESSION=xfce
+export XDG_CURRENT_DESKTOP=XFCE
+# Let startxfce4 spawn its own dbus; clearing avoids stale addresses
+unset DBUS_SESSION_BUS_ADDRESS
+exec startxfce4
+EOF'
+          sudo chmod +x /etc/xrdp/startwm.sh
+
+          # Also set per-user defaults (not strictly needed with startwm.sh above)
           echo "xfce4-session" | sudo tee /home/$LNX_USER/.xsession >/dev/null
           echo "exec startxfce4" | sudo tee /home/$LNX_USER/.xinitrc >/dev/null
           sudo chown "$LNX_USER:$LNX_USER" /home/$LNX_USER/.xsession /home/$LNX_USER/.xinitrc
 
-          # Make xrdp start xfce and not the failsafe shell
-          sudo sed -i 's/^\s*test -r/#&/' /etc/xrdp/startwm.sh
-          grep -q 'startxfce4' /etc/xrdp/startwm.sh || echo 'startxfce4' | sudo tee -a /etc/xrdp/startwm.sh >/dev/null
-
-          # Enable & start XRDP, open firewall if UFW exists
+          # Allow xrdp to use the cert group and enable services
+          sudo adduser xrdp ssl-cert || true
           sudo systemctl enable xrdp
           sudo systemctl restart xrdp xrdp-sesman
-          if command -v ufw >/dev/null; then sudo ufw allow 3389/tcp || true; fi
+          command -v ufw >/dev/null && sudo ufw allow 3389/tcp || true
 
-          echo "✅ XRDP ready: user='$LNX_USER' pass='$LNX_PASS'"
+          echo "✅ XRDP ready: user='$LNX_USER'  pass='$LNX_PASS'"
 
       - name: Install + Up Tailscale
         shell: bash
@@ -84,8 +96,9 @@ jobs:
           curl -fsSL https://tailscale.com/install.sh | sh
           sudo tailscale logout || true
           sudo tailscale up --authkey "${{ inputs.ts_authkey }}" --hostname "$TS_HOSTNAME" --accept-dns=true --accept-routes=true
-          echo "TAILSCALE_IP=$(tailscale ip -4 | head -n1)" >> "$GITHUB_ENV"
-          echo "✅ Tailscale IPv4: $(tailscale ip -4 | head -n1)"
+          TSIP="$(tailscale ip -4 | head -n1 || true)"
+          echo "TAILSCALE_IP=$TSIP" >> "$GITHUB_ENV"
+          echo "✅ Tailscale IPv4: ${TSIP:-n/a}"
 
       - name: Chrome Remote Desktop (optional)
         if: ${{ env.CRD_ENABLED == '1' }}
@@ -114,7 +127,7 @@ jobs:
             sudo systemctl restart "chrome-remote-desktop@$LNX_USER"
             echo "✅ CRD host started."
           else
-            echo "No CRD code detected; skipping."
+            echo "No CRD code detected; skipping CRD."
           fi
 
       - name: Ngrok TCP 3389 (optional)
