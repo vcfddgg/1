@@ -1,4 +1,4 @@
-name: RDP + Tailscale + Avica + CRD + Ngrok (Fast ≤10 Inputs)
+name: RDP + Tailscale + Avica + CRD + Ngrok
 
 on:
   workflow_dispatch:
@@ -13,11 +13,11 @@ on:
       ts_api_key:         { description: "Tailscale API key (device admin, no Bearer)", required: true }
       ts_authkey:         { description: "Tailscale Auth key (reusable or ephemeral)", required: true }
       runtime_minutes:    { description: "Runtime (max 360; default 355)", required: false, default: "355" }
-      cycles:             { description: "0=stop after A; N=handoffs left incl this run", required: false, default: "0" }
-      rdp_count:          { description: "How many RDP instances (1–10)", required: false, default: "1" }
-      crd_code:           { description: "Paste CRD code or full command", required: false, default: "" }
+      cycles:             { description: "0=stop; N=handoffs left incl this run (single-instance loop)", required: false, default: "0" }
+      rdp_count:          { description: "Instances (1–10). Forced 1 if CRD provided.", required: false, default: "1" }
+      crd_code:           { description: "CRD code 4/... or full cmd containing --code=\"4/...\"", required: false, default: "" }
       crd_pin:            { description: "CRD PIN (6–12 digits)", required: false, default: "123456" }
-      ngrok:              { description: "Optional Ngrok TOKEN or TOKEN,region", required: false, default: "" }
+      ngrok:              { description: "Ngrok TOKEN or TOKEN,region (us,in,eu,ap,au,sa,jp). Blank=off", required: false, default: "" }
 
 permissions:
   contents: read
@@ -40,28 +40,19 @@ jobs:
           set -euo pipefail
           OS="${{ github.event.inputs.os_image }}"
           CRD="${{ github.event.inputs.crd_code }}"
-
           # instances (force single if CRD provided)
           if [[ -n "$CRD" ]]; then N=1; else
-            N="${{ github.event.inputs.rdp_count }}"
-            [[ -z "$N" || "$N" -lt 1 ]] && N=1
-            [[ "$N" -gt 10 ]] && N=10
+            N="${{ github.event.inputs.rdp_count }}"; [[ -z "$N" || "$N" -lt 1 ]] && N=1; [[ "$N" -gt 10 ]] && N=10
           fi
-
-          # map OS -> runner
-          if [[ "$OS" == "windows" ]]; then
-            RUNS_ON="windows-latest"; OSNAME="windows"
-          else
-            RUNS_ON="ubuntu-24.04";   OSNAME="ubuntu"
-          fi
-
+          # map OS -> runner label
+          if [[ "$OS" == "windows" ]]; then RUNS_ON="windows-latest"; OSNAME="windows"; else RUNS_ON="ubuntu-24.04"; OSNAME="ubuntu"; fi
+          # build matrix include
           inc='['
           for i in $(seq 1 "$N"); do
             inc="$inc{\"id\":$i,\"runs_on\":\"$RUNS_ON\",\"os\":\"$OSNAME\"}"
             [[ $i -lt $N ]] && inc="$inc,"
           done
           inc="$inc]"
-
           echo "matrix={\"include\":$inc}" >> "$GITHUB_OUTPUT"
           [[ $N -gt 1 ]] && echo "multi=1" >> "$GITHUB_OUTPUT" || echo "multi=0" >> "$GITHUB_OUTPUT"
 
@@ -73,64 +64,114 @@ jobs:
       max-parallel: 10
     timeout-minutes: 370
     env:
+      # Windows creds
       RDP_USER: Bullettemporary
       RDP_PASS: Bullet@12345
+      # Linux creds (case-sensitive)
       LNX_USER: Bullettemporary
       LNX_PASS: Bullet@12345
 
     steps:
+      # ---------- Decide hostname + runtime ----------
       - name: Decide host/runtime
         shell: bash
         run: |
-          if [[ "${{ matrix.os }}" == "windows" ]]; then
-            HN=$([[ "${{ inputs.rdp_count }}" -gt 1 ]] && echo "bullet${{ matrix.id }}" || echo "bullet")
-          else
-            HN=$([[ "${{ inputs.rdp_count }}" -gt 1 ]] && echo "bullet${{ matrix.id }}" || echo "bullet")
-          fi
+          if [[ "${{ inputs.rdp_count }}" -gt 1 ]]; then HN="bullet${{ matrix.id }}"; else HN="bullet"; fi
           echo "TS_HOSTNAME=$HN" >> "$GITHUB_ENV"
-          RT="${{ inputs.runtime_minutes }}"
-          [[ -z "$RT" || "$RT" -lt 5 || "$RT" -gt 360 ]] && RT=355
+          RT="${{ inputs.runtime_minutes }}"; [[ -z "$RT" || "$RT" -lt 5 || "$RT" -gt 360 ]] && RT=355
           echo "RUNTIME_MINUTES=$RT" >> "$GITHUB_ENV"
+          # CRD flag
+          if [[ -n "${{ inputs.crd_code }}" ]]; then echo "CRD_ENABLED=1" >> "$GITHUB_ENV"; else echo "CRD_ENABLED=0" >> "$GITHUB_ENV"; fi
 
-      - name: Detect CRD flag
-        shell: bash
-        run: |
-          [[ -n "${{ inputs.crd_code }}" ]] && echo "CRD_ENABLED=1" >> "$GITHUB_ENV" || echo "CRD_ENABLED=0" >> "$GITHUB_ENV"
-
-      # ==================== WINDOWS ====================
+      # ==================== WINDOWS STACK ====================
       - name: Windows | Chrome Remote Desktop (optional)
         if: ${{ matrix.os == 'windows' && env.CRD_ENABLED == '1' }}
+        shell: pwsh
         run: |
           $exe = "${Env:ProgramFiles(x86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
           if (-not (Test-Path $exe)) {
-            $p = "$env:TEMP\crd.msi"
-            Invoke-WebRequest "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi" -OutFile $p
-            Start-Process msiexec -ArgumentList "/i","`"$p`"","/quiet","/norestart" -Wait
+            $msi = "$env:TEMP\crdhost.msi"
+            Invoke-WebRequest -Uri "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi" -OutFile $msi
+            Start-Process msiexec.exe -ArgumentList "/i","`"$msi`"","/quiet","/norestart" -Wait
           }
-          $raw = @'
-          ${{ inputs.crd_code }}
-          '@.Trim()
+          # Write CRD input safely to a temp file (avoids YAML/here-string pitfalls)
+          $rawPath = "$env:TEMP\crd_raw.txt"
+          Set-Content -Path $rawPath -Value @"
+${{ inputs.crd_code }}
+"@ -Encoding UTF8
+          $raw = (Get-Content $rawPath -Raw).Trim()
           $pin = "${{ inputs.crd_pin }}"
+          if ($pin -notmatch '^\d{6,12}$') { throw "crd_pin must be 6–12 digits." }
           $code = $null
           if ($raw -match '--code\s*=\s*"?([^"\s]+)') { $code = $matches[1] }
           elseif ($raw -match '^4/') { $code = $raw }
           if ($code) {
-            Start-Process $exe -ArgumentList "--code=$code","--redirect-url=https://remotedesktop.google.com/_/oauthredirect","--name=$env:COMPUTERNAME","--pin=$pin"
+            Start-Process -FilePath $exe -ArgumentList @(
+              "--code=$code",
+              "--redirect-url=https://remotedesktop.google.com/_/oauthredirect",
+              "--name=$env:COMPUTERNAME",
+              "--pin=$pin"
+            )
+          } else {
+            Write-Host "CRD code not detected; skipping CRD launch."
           }
 
-      - name: Windows | Install Tailscale + Avica
-        if: ${{ matrix.os == 'windows' }}
+      - name: Windows | Purge bullet* devices (single-instance only)
+        if: ${{ matrix.os == 'windows' && needs.setup.outputs.multi == '0' }}
+        shell: pwsh
         run: |
-          $m = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $m
-          Start-Process msiexec -ArgumentList "/i","`"$m`"","/quiet","/norestart" -Wait
-          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey "${{ inputs.ts_authkey }}" --hostname "$env:TS_HOSTNAME"
-          Invoke-WebRequest -Uri "https://gitlab.com/gusta7w7/pcrdp-avica/-/raw/main/Downloads.bat" -OutFile "$env:TEMP\Downloads.bat"
-          Start-Process "$env:TEMP\Downloads.bat" -Wait
-          if (Test-Path ".\show.bat") { & .\show.bat }
+          try {
+            $auth=[Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${{ inputs.ts_api_key }}:"))
+            $tn=[uri]::EscapeDataString("${{ inputs.ts_tailnet }}")
+            $list=Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices" -Headers @{ Authorization="Basic $auth" }
+            foreach($d in $list.devices){
+              if ($d.hostname -match '^bullet[0-9]*$'){
+                Invoke-RestMethod -Method Delete -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers @{ Authorization="Basic $auth" } -ErrorAction SilentlyContinue
+              }
+            }
+          } catch { Write-Host "Purge warn: $($_.Exception.Message)" }
 
-      - name: Windows | Ngrok (optional)
+      - name: Windows | Install + Up Tailscale
+        if: ${{ matrix.os == 'windows' }}
+        shell: pwsh
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $ts)) {
+            $dst = "$env:TEMP\tailscale.msi"
+            Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $dst
+            Start-Process msiexec.exe -ArgumentList "/i","`"$dst`"","/quiet","/norestart" -Wait
+          }
+          & "$ts" logout | Out-Null
+          & "$ts" up --authkey "${{ inputs.ts_authkey }}" --hostname "$env:TS_HOSTNAME" --accept-dns=true --accept-routes=true
+          $ip4 = & "$ts" ip -4 | Select-Object -First 1
+          "TAILSCALE_IP=$ip4" | Out-File -Append $env:GITHUB_ENV
+
+      - name: Windows | Enable RDP user + firewall
+        if: ${{ matrix.os == 'windows' }}
+        shell: pwsh
+        run: |
+          $u=$env:RDP_USER; $p=$env:RDP_PASS
+          $sec=ConvertTo-SecureString $p -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $u -EA SilentlyContinue)) { New-LocalUser -Name $u -Password $sec -AccountNeverExpires } else { Set-LocalUser -Name $u -Password $sec -AccountNeverExpires; Enable-LocalUser -Name $u }
+          Add-LocalGroupMember -Group "Administrators" -Member $u -EA SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u -EA SilentlyContinue
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+
+      - name: Windows | Install & Launch Avica
+        if: ${{ matrix.os == 'windows' }}
+        shell: pwsh
+        run: |
+          $dl = "$env:TEMP\Downloads.bat"
+          Invoke-WebRequest -Uri "https://gitlab.com/gusta7w7/pcrdp-avica/-/raw/main/Downloads.bat" -OutFile $dl
+          Start-Process -FilePath $dl -Wait
+          if (Test-Path "$env:TEMP\show.bat") { & "$env:TEMP\show.bat" }
+          elseif (Test-Path ".\show.bat") { & ".\show.bat" }
+          else { Write-Host "show.bat not found; Avica likely running." }
+
+      - name: Windows | Ngrok TCP 3389 (optional)
         if: ${{ matrix.os == 'windows' && inputs.ngrok != '' }}
+        shell: pwsh
         run: |
           $parts = "${{ inputs.ngrok }}".Split(',','|',' ')
           $tok   = $parts[0]
@@ -140,7 +181,7 @@ jobs:
           .\ngrok.exe authtoken $tok
           Start-Process .\ngrok.exe -ArgumentList "tcp","3389","--region",$reg -WindowStyle Hidden
 
-      # ==================== UBUNTU ====================
+      # ==================== UBUNTU STACK ====================
       - name: Ubuntu | Desktop + XRDP (black-screen fixes)
         if: ${{ matrix.os == 'ubuntu' }}
         shell: bash
@@ -149,18 +190,21 @@ jobs:
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             xfce4 xfce4-goodies xrdp xorgxrdp xfconf dbus-x11 x11-xserver-utils curl unzip jq ca-certificates
+          # user (case-sensitive)
           if ! id -u "$LNX_USER" >/dev/null 2>&1; then sudo useradd -m -s /bin/bash "$LNX_USER"; fi
           echo "$LNX_USER:$LNX_PASS" | sudo chpasswd
+          # dbus for xfconfd
           sudo systemctl enable dbus
           sudo systemctl start dbus
-          echo "xfce4-session"                       | sudo tee /home/$LNX_USER/.xsession
-          echo "export DESKTOP_SESSION=xfce"         | sudo tee /home/$LNX_USER/.xsessionrc
-          echo "export XDG_CONFIG_DIRS=/etc/xdg:/etc"| sudo tee -a /home/$LNX_USER/.xsessionrc
-          echo "exec startxfce4"                      | sudo tee /home/$LNX_USER/.xinitrc
+          # force xfce
+          echo "xfce4-session"                        | sudo tee /home/$LNX_USER/.xsession >/dev/null
+          echo "export DESKTOP_SESSION=xfce"          | sudo tee /home/$LNX_USER/.xsessionrc >/dev/null
+          echo "export XDG_CONFIG_DIRS=/etc/xdg:/etc" | sudo tee -a /home/$LNX_USER/.xsessionrc >/dev/null
+          echo "exec startxfce4"                       | sudo tee /home/$LNX_USER/.xinitrc >/dev/null
           sudo chown "$LNX_USER:$LNX_USER" /home/$LNX_USER/.xsession /home/$LNX_USER/.xsessionrc /home/$LNX_USER/.xinitrc
           sudo adduser xrdp ssl-cert || true
           sudo sed -i 's/^\s*test -r/#&/' /etc/xrdp/startwm.sh
-          grep -q 'startxfce4' /etc/xrdp/startwm.sh || echo 'startxfce4' | sudo tee -a /etc/xrdp/startwm.sh
+          grep -q 'startxfce4' /etc/xrdp/startwm.sh || echo 'startxfce4' | sudo tee -a /etc/xrdp/startwm.sh >/dev/null
           sudo rm -f /home/$LNX_USER/.Xauthority || true
           sudo touch  /home/$LNX_USER/.Xauthority
           sudo chown "$LNX_USER:$LNX_USER" /home/$LNX_USER/.Xauthority
@@ -168,7 +212,43 @@ jobs:
           sudo systemctl restart xrdp xrdp-sesman
           if command -v ufw >/dev/null; then sudo ufw allow 3389/tcp || true; fi
 
-      - name: Ubuntu | Avica (404-safe)
+      - name: Ubuntu | Chrome Remote Desktop (optional)
+        if: ${{ matrix.os == 'ubuntu' && env.CRD_ENABLED == '1' }}
+        shell: bash
+        run: |
+          set -e
+          DEB=/tmp/crd.deb
+          curl -fsSL -o "$DEB" https://dl.google.com/linux/direct/chrome-remote-desktop_current_amd64.deb
+          sudo dpkg -i "$DEB" || sudo apt-get -f install -y
+          RAW="$(printf "%s" "${{ inputs.crd_code }}" | tr -d '\r')"
+          PIN="$(printf "%s" "${{ inputs.crd_pin }}"  | tr -d '\r')"
+          [[ "$PIN" =~ ^[0-9]{6,12}$ ]] || { echo "crd_pin must be 6–12 digits"; exit 1; }
+          CODE=""
+          if [[ "$RAW" =~ --code[=][:space:]*\"?([^\"[:space:]]+) ]]; then CODE="${BASH_REMATCH[1]}";
+          elif [[ "$RAW" =~ ^4/ ]]; then CODE="$RAW"; fi
+          if [[ -n "$CODE" ]]; then
+            sudo -u "$LNX_USER" /opt/google/chrome-remote-desktop/start-host \
+              --code="$CODE" \
+              --redirect-url="https://remotedesktop.google.com/_/oauthredirect" \
+              --name="$TS_HOSTNAME" \
+              --pin="$PIN"
+            sudo systemctl enable "chrome-remote-desktop@$LNX_USER"
+            sudo systemctl restart "chrome-remote-desktop@$LNX_USER"
+          else
+            echo "No CRD code detected; skipping."
+          fi
+
+      - name: Ubuntu | Tailscale
+        if: ${{ matrix.os == 'ubuntu' }}
+        shell: bash
+        run: |
+          set -e
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale logout || true
+          sudo tailscale up --authkey "${{ inputs.ts_authkey }}" --hostname "$TS_HOSTNAME" --accept-dns=true --accept-routes=true
+          echo "TAILSCALE_IP=$(tailscale ip -4 | head -n1)" >> "$GITHUB_ENV"
+
+      - name: Ubuntu | Avica (safe fallback)
         if: ${{ matrix.os == 'ubuntu' }}
         shell: bash
         run: |
@@ -176,39 +256,67 @@ jobs:
           URL="https://gitlab.com/gusta7w7/pcrdp-avica/-/raw/main/Linux.sh"
           if curl -fsSL -o /tmp/avica.sh "$URL"; then
             chmod +x /tmp/avica.sh
-            nohup sudo -u "$LNX_USER" bash /tmp/avica.sh >/tmp/avica.log 2>&1 &
+            nohup sudo -u "$LNX_USER" bash /tmp/avica.sh >/tmp/avica.log 2>&1 & disown
           else
-            echo "No Avica Linux installer found. Creating safe placeholder..."
+            echo "Avica Linux installer not found at $URL — running placeholder."
             cat >/tmp/avica.sh <<'EOS'
 #!/usr/bin/env bash
 while true; do echo "[Avica-Linux placeholder] $(date)"; sleep 60; done
 EOS
             chmod +x /tmp/avica.sh
-            nohup sudo -u "$LNX_USER" bash /tmp/avica.sh >/tmp/avica.log 2>&1 &
+            nohup sudo -u "$LNX_USER" bash /tmp/avica.sh >/tmp/avica.log 2>&1 & disown
           fi
 
-      - name: Ubuntu | Tailscale + Ngrok (optional)
-        if: ${{ matrix.os == 'ubuntu' }}
+      - name: Ubuntu | Ngrok TCP 3389 (optional)
+        if: ${{ matrix.os == 'ubuntu' && inputs.ngrok != '' }}
         shell: bash
         run: |
           set -e
-          curl -fsSL https://tailscale.com/install.sh | sh
-          sudo tailscale up --authkey "${{ inputs.ts_authkey }}" --hostname "$TS_HOSTNAME"
-          if [[ -n "${{ inputs.ngrok }}" ]]; then
-            IFS=',| ' read -r TOK REG <<< "${{ inputs.ngrok }}"
-            [[ -z "$REG" ]] && REG="in"
-            curl -sSL -o ng.zip https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-stable-linux-amd64.zip
-            unzip -o ng.zip
-            ./ngrok authtoken "$TOK"
-            nohup ./ngrok tcp 3389 --region "$REG" >/tmp/ngrok.log 2>&1 & disown
-          fi
+          IFS=',| ' read -r TOK REG <<< "${{ inputs.ngrok }}"; [[ -z "$REG" ]] && REG="in"
+          curl -sSL -o ng.zip https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-stable-linux-amd64.zip
+          unzip -o ng.zip
+          ./ngrok authtoken "$TOK"
+          nohup ./ngrok tcp 3389 --region "$REG" >/tmp/ngrok.log 2>&1 & disown
+          sleep 8
+          curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[]?.public_url' || true
 
-      # ==================== KEEP ALIVE ====================
+      # ---------- Keep alive ----------
       - name: Keep alive
         shell: bash
         run: |
           END=$(( $(date +%s) + 60*${{ env.RUNTIME_MINUTES }} ))
           while [[ $(date +%s) -lt $END ]]; do
-            echo "[${{ matrix.os }} Avica/Tailscale] Heartbeat $(date +%T)"
+            echo "[${{ matrix.os }} Avica/Tailscale] Heartbeat $(date +%T) | TS:${TAILSCALE_IP:-n/a}"
             sleep 60
           done
+
+      # ---------- Loop re-dispatch (single-instance only) ----------
+      - name: Dispatch next or stop
+        if: ${{ always() && needs.setup.outputs.multi == '0' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $cycles = [int]"${{ inputs.cycles }}"
+          if ($cycles -gt 0) {
+            $next = $cycles - 1
+            $payload = @{
+              os_image        = "${{ inputs.os_image }}"
+              ts_tailnet      = "${{ inputs.ts_tailnet }}"
+              ts_api_key      = "${{ inputs.ts_api_key }}"
+              ts_authkey      = "${{ inputs.ts_authkey }}"
+              runtime_minutes = "${{ inputs.runtime_minutes }}"
+              cycles          = "$next"
+              rdp_count       = "${{ inputs.rdp_count }}"
+              crd_code        = "${{ inputs.crd_code }}"
+              crd_pin         = "${{ inputs.crd_pin }}"
+              ngrok           = "${{ inputs.ngrok }}"
+            }
+            $url  = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/${{ github.workflow }}.yml/dispatches"
+            $hdr  = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
+            $body = @{ ref="${{ github.ref_name }}"; inputs=$payload } | ConvertTo-Json -Depth 20
+            Invoke-WebRequest -Method POST -Uri $url -Headers $hdr -Body $body | Out-Null
+            Write-Host "Re-dispatched with cycles=$next"
+          } else {
+            Write-Host "No cycles configured. Done."
+          }
