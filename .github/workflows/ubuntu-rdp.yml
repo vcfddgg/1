@@ -1,24 +1,24 @@
-name: Ubuntu RDP 6-Hour Stable
+name: Ubuntu RDP 6-Hour (XFCE, XRDP, fixed)
 
 on:
   workflow_dispatch:
     inputs:
       ts_authkey:
-        description: "Tailscale Auth Key (optional)"
+        description: "Optional: Tailscale Auth Key"
+        required: false
+        default: ""
+      ngrok:
+        description: "Optional: Ngrok TOKEN or TOKEN,region (us,in,eu,ap,au,sa,jp)"
         required: false
         default: ""
       crd_code:
-        description: "Optional Chrome Remote Desktop code (--code=\"4/...\" or full command)"
+        description: "Optional: CRD code (--code=\"4/...\" or full command)"
         required: false
         default: ""
       crd_pin:
         description: "CRD PIN (6–12 digits)"
         required: false
         default: "123456"
-      ngrok:
-        description: "Optional Ngrok Token or Token,region (us,in,eu,ap,au,sa,jp)"
-        required: false
-        default: ""
 
 jobs:
   ubuntu_rdp:
@@ -30,75 +30,87 @@ jobs:
       RUNTIME_MINUTES: 355
 
     steps:
-      - name: 🧩 Prepare System & User
+      - name: 🧩 Install desktop + XRDP (dbus + policykit fix)
         shell: bash
         run: |
           set -e
-          sudo apt update
-          sudo apt install -y xfce4 xfce4-goodies xorg xrdp xfconf dbus-x11 x11-xserver-utils curl jq unzip
-          
-          # Create user
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            xfce4 xfce4-goodies xrdp xorgxrdp xfconf dbus-x11 x11-xserver-utils \
+            policykit-1 gvfs xorg locales curl jq unzip
+
+          # Locale (prevents odd desktop errors)
+          sudo locale-gen en_US.UTF-8
+          echo 'LANG=en_US.UTF-8' | sudo tee /etc/default/locale >/dev/null
+
+          # Create RDP user
           if ! id -u "$USERNAME" >/dev/null 2>&1; then
             sudo useradd -m -s /bin/bash "$USERNAME"
           fi
           echo "$USERNAME:$PASSWORD" | sudo chpasswd
           echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/$USERNAME >/dev/null
-          
-          # Fix XFCE failsafe-session
+
+          # Allow anybody to start Xorg via xrdp
+          echo "allowed_users=anybody" | sudo tee /etc/X11/Xwrapper.config >/dev/null
+
+          # Make sure system D-Bus is up
           sudo systemctl enable dbus
           sudo systemctl start dbus
-          echo "XDG_CONFIG_DIRS=/etc/xdg:/etc" | sudo tee -a /etc/environment >/dev/null
-          sudo -u "$USERNAME" touch /home/$USERNAME/.Xauthority
-          sudo chown "$USERNAME:$USERNAME" /home/$USERNAME/.Xauthority
-          
-          # Replace startwm.sh
-          sudo bash -c 'cat > /etc/xrdp/startwm.sh <<EOF
-          #!/bin/sh
-          export XDG_CONFIG_DIRS=/etc/xdg:/etc
-          export DESKTOP_SESSION=xfce
-          export XDG_CURRENT_DESKTOP=XFCE
-          unset DBUS_SESSION_BUS_ADDRESS
-          exec startxfce4
-          EOF'
+
+          # Ensure XDG path includes /etc
+          if ! grep -q '^XDG_CONFIG_DIRS=' /etc/environment; then
+            echo 'XDG_CONFIG_DIRS=/etc/xdg:/etc' | sudo tee -a /etc/environment >/dev/null
+          fi
+
+          # User X auth file
+          sudo -u "$USERNAME" touch "/home/$USERNAME/.Xauthority"
+          sudo chown "$USERNAME:$USERNAME" "/home/$USERNAME/.Xauthority"
+
+          # Minimal, dbus-aware start script for XRDP
+          sudo bash -c 'cat > /etc/xrdp/startwm.sh << "EOF"
+#!/bin/sh
+# XRDP -> XFCE with a guaranteed per-session D-Bus
+export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
+export XDG_CONFIG_DIRS=/etc/xdg:/etc
+export DESKTOP_SESSION=xfce
+export XDG_CURRENT_DESKTOP=XFCE
+unset DBUS_SESSION_BUS_ADDRESS
+
+# Ensure runtime dir (usually exists on Ubuntu runners)
+if [ -z "$XDG_RUNTIME_DIR" ]; then
+  export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+  [ -d "$XDG_RUNTIME_DIR" ] || mkdir -p "$XDG_RUNTIME_DIR"
+  chmod 700 "$XDG_RUNTIME_DIR" || true
+fi
+
+# Start a fresh user bus for this XRDP session and run XFCE on it
+eval "$(dbus-launch --sh-syntax)"
+exec startxfce4
+EOF'
           sudo chmod +x /etc/xrdp/startwm.sh
-          
+
+          # Per-user defaults (extra safety)
+          echo "exec startxfce4" | sudo tee /home/$USERNAME/.xsession >/dev/null
+          echo "exec startxfce4" | sudo tee /home/$USERNAME/.xinitrc >/dev/null
+          sudo chown "$USERNAME:$USERNAME" /home/$USERNAME/.xsession /home/$USERNAME/.xinitrc
+
           # Enable XRDP
           sudo adduser xrdp ssl-cert || true
           sudo systemctl enable xrdp
           sudo systemctl restart xrdp xrdp-sesman
-          
-          echo "✅ XRDP ready: User=$USERNAME  Pass=$PASSWORD  Port=3389"
 
-      - name: 🌐 Optional - Start Tailscale
+          echo "✅ XRDP ready: user=$USERNAME pass=$PASSWORD (port 3389)"
+
+      - name: 🌐 Optional Tailscale
         if: ${{ inputs.ts_authkey != '' }}
         shell: bash
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
-          sudo tailscale up --authkey "${{ inputs.ts_authkey }}" --hostname "bullet-ubuntu" --accept-dns=true --accept-routes=true
-          TSIP=$(tailscale ip -4 | head -n1)
-          echo "Tailscale IP: $TSIP"
+          sudo tailscale up --authkey "${{ inputs.ts_authkey }}" --hostname "ubuntu-rdp" --accept-dns=true --accept-routes=true
+          echo "Tailscale IP: $(tailscale ip -4 | head -n1)"
 
-      - name: 💻 Optional - Chrome Remote Desktop
-        if: ${{ inputs.crd_code != '' }}
-        shell: bash
-        run: |
-          set -e
-          DEB=/tmp/crd.deb
-          curl -fsSL -o "$DEB" https://dl.google.com/linux/direct/chrome-remote-desktop_current_amd64.deb
-          sudo dpkg -i "$DEB" || sudo apt -f install -y
-          CODE_RAW="${{ inputs.crd_code }}"
-          PIN="${{ inputs.crd_pin }}"
-          [[ "$PIN" =~ ^[0-9]{6,12}$ ]] || { echo "Invalid CRD PIN"; exit 1; }
-          CODE=$(echo "$CODE_RAW" | grep -o '4/[^"]*' | head -n1)
-          [[ -z "$CODE" ]] && { echo "No CRD code detected"; exit 1; }
-          sudo -u "$USERNAME" /opt/google/chrome-remote-desktop/start-host \
-            --code="$CODE" --redirect-url="https://remotedesktop.google.com/_/oauthredirect" \
-            --name="Ubuntu-RDP" --pin="$PIN"
-          sudo systemctl enable chrome-remote-desktop@$USERNAME
-          sudo systemctl restart chrome-remote-desktop@$USERNAME
-          echo "✅ CRD running."
-
-      - name: ⚙️ Optional - Ngrok Tunnel (Port 3389)
+      - name: ⚙️ Optional Ngrok (TCP 3389)
         if: ${{ inputs.ngrok != '' }}
         shell: bash
         run: |
@@ -111,14 +123,36 @@ jobs:
           ./ngrok authtoken "$TOK"
           nohup ./ngrok tcp 3389 --region "$REG" >/tmp/ngrok.log 2>&1 &
           sleep 8
-          echo "Ngrok URL:"
-          curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[]?.public_url'
+          echo "Ngrok URL(s):"
+          curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[]?.public_url' || true
 
-      - name: 🕒 Keep Alive for 6 Hours
+      - name: 💻 Optional Chrome Remote Desktop
+        if: ${{ inputs.crd_code != '' }}
+        shell: bash
+        run: |
+          set -e
+          DEB=/tmp/crd.deb
+          curl -fsSL -o "$DEB" https://dl.google.com/linux/direct/chrome-remote-desktop_current_amd64.deb
+          sudo dpkg -i "$DEB" || sudo apt -f install -y
+          CODE_RAW="${{ inputs.crd_code }}"
+          PIN="${{ inputs.crd_pin }}"
+          echo "$PIN" | grep -Eq '^[0-9]{6,12}$' || { echo "Invalid CRD PIN"; exit 1; }
+          CODE=$(echo "$CODE_RAW" | sed -n 's/.*--code="\{0,1\}\(4\/[^" ]*\).*/\1/p' | head -n1)
+          [ -z "$CODE" ] && { echo "No CRD code detected"; exit 1; }
+          sudo -u "$USERNAME" /opt/google/chrome-remote-desktop/start-host \
+            --code="$CODE" \
+            --redirect-url="https://remotedesktop.google.com/_/oauthredirect" \
+            --name="ubuntu-rdp" \
+            --pin="$PIN"
+          sudo systemctl enable chrome-remote-desktop@$USERNAME
+          sudo systemctl restart chrome-remote-desktop@$USERNAME
+          echo "✅ CRD started."
+
+      - name: 🕒 Keep alive ~6 hours
         shell: bash
         run: |
           END=$(( $(date +%s) + 60 * $RUNTIME_MINUTES ))
           while [ $(date +%s) -lt $END ]; do
-            echo "💚 Ubuntu RDP Live | $(date +%T)"
+            echo "💚 Live $(date +%T)"
             sleep 60
           done
