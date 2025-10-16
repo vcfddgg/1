@@ -1,18 +1,18 @@
-name: Ubuntu RDP 6-Hour (XFCE, XRDP, fixed)
+name: Ubuntu RDP 6h Stable
 
 on:
   workflow_dispatch:
     inputs:
       ts_authkey:
-        description: "Optional: Tailscale Auth Key"
+        description: "Tailscale Auth Key (optional)"
         required: false
         default: ""
       ngrok:
-        description: "Optional: Ngrok TOKEN or TOKEN,region (us,in,eu,ap,au,sa,jp)"
+        description: "Ngrok TOKEN or TOKEN,region (optional)"
         required: false
         default: ""
       crd_code:
-        description: "Optional: CRD code (--code=\"4/...\" or full command)"
+        description: "CRD code (--code=\"4/...\" or full command) (optional)"
         required: false
         default: ""
       crd_pin:
@@ -30,7 +30,7 @@ jobs:
       RUNTIME_MINUTES: 355
 
     steps:
-      - name: 🧩 Install desktop + XRDP (dbus + policykit fix)
+      - name: Install desktop + XRDP (dbus/polkit fixes)
         shell: bash
         run: |
           set -e
@@ -39,58 +39,50 @@ jobs:
             xfce4 xfce4-goodies xrdp xorgxrdp xfconf dbus-x11 x11-xserver-utils \
             policykit-1 gvfs xorg locales curl jq unzip
 
-          # Locale (prevents odd desktop errors)
+          # Locale
           sudo locale-gen en_US.UTF-8
           echo 'LANG=en_US.UTF-8' | sudo tee /etc/default/locale >/dev/null
 
-          # Create RDP user
+          # RDP user
           if ! id -u "$USERNAME" >/dev/null 2>&1; then
             sudo useradd -m -s /bin/bash "$USERNAME"
           fi
           echo "$USERNAME:$PASSWORD" | sudo chpasswd
           echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/$USERNAME >/dev/null
 
-          # Allow anybody to start Xorg via xrdp
+          # Allow xrdp to start Xorg
           echo "allowed_users=anybody" | sudo tee /etc/X11/Xwrapper.config >/dev/null
 
-          # Make sure system D-Bus is up
+          # System dbus
           sudo systemctl enable dbus
           sudo systemctl start dbus
 
-          # Ensure XDG path includes /etc
+          # XDG path
           if ! grep -q '^XDG_CONFIG_DIRS=' /etc/environment; then
             echo 'XDG_CONFIG_DIRS=/etc/xdg:/etc' | sudo tee -a /etc/environment >/dev/null
           fi
 
-          # User X auth file
+          # Ensure .Xauthority
           sudo -u "$USERNAME" touch "/home/$USERNAME/.Xauthority"
           sudo chown "$USERNAME:$USERNAME" "/home/$USERNAME/.Xauthority"
 
-          # Minimal, dbus-aware start script for XRDP
-          sudo bash -c 'cat > /etc/xrdp/startwm.sh << "EOF"
-#!/bin/sh
-# XRDP -> XFCE with a guaranteed per-session D-Bus
-export LANG=en_US.UTF-8
-export LC_ALL=en_US.UTF-8
-export XDG_CONFIG_DIRS=/etc/xdg:/etc
-export DESKTOP_SESSION=xfce
-export XDG_CURRENT_DESKTOP=XFCE
-unset DBUS_SESSION_BUS_ADDRESS
-
-# Ensure runtime dir (usually exists on Ubuntu runners)
-if [ -z "$XDG_RUNTIME_DIR" ]; then
-  export XDG_RUNTIME_DIR="/run/user/$(id -u)"
-  [ -d "$XDG_RUNTIME_DIR" ] || mkdir -p "$XDG_RUNTIME_DIR"
-  chmod 700 "$XDG_RUNTIME_DIR" || true
-fi
-
-# Start a fresh user bus for this XRDP session and run XFCE on it
-eval "$(dbus-launch --sh-syntax)"
-exec startxfce4
-EOF'
+          # Write minimal startwm.sh WITHOUT heredoc (prevents YAML issues)
+          sudo bash -c 'printf "%s\n" \
+            "#!/bin/sh" \
+            "export LANG=en_US.UTF-8" \
+            "export LC_ALL=en_US.UTF-8" \
+            "export XDG_CONFIG_DIRS=/etc/xdg:/etc" \
+            "export DESKTOP_SESSION=xfce" \
+            "export XDG_CURRENT_DESKTOP=XFCE" \
+            "unset DBUS_SESSION_BUS_ADDRESS" \
+            "[ -z \"\$XDG_RUNTIME_DIR\" ] && export XDG_RUNTIME_DIR=/run/user/\$(id -u)" \
+            "[ -d \"\$XDG_RUNTIME_DIR\" ] || mkdir -p \"\$XDG_RUNTIME_DIR\"" \
+            "chmod 700 \"\$XDG_RUNTIME_DIR\" || true" \
+            "eval \"\$(dbus-launch --sh-syntax)\"" \
+            "exec startxfce4" > /etc/xrdp/startwm.sh'
           sudo chmod +x /etc/xrdp/startwm.sh
 
-          # Per-user defaults (extra safety)
+          # Per-user defaults
           echo "exec startxfce4" | sudo tee /home/$USERNAME/.xsession >/dev/null
           echo "exec startxfce4" | sudo tee /home/$USERNAME/.xinitrc >/dev/null
           sudo chown "$USERNAME:$USERNAME" /home/$USERNAME/.xsession /home/$USERNAME/.xinitrc
@@ -100,20 +92,22 @@ EOF'
           sudo systemctl enable xrdp
           sudo systemctl restart xrdp xrdp-sesman
 
-          echo "✅ XRDP ready: user=$USERNAME pass=$PASSWORD (port 3389)"
+          echo "XRDP ready: user=$USERNAME pass=$PASSWORD port=3389"
 
-      - name: 🌐 Optional Tailscale
+      - name: Tailscale (optional)
         if: ${{ inputs.ts_authkey != '' }}
         shell: bash
         run: |
+          set -e
           curl -fsSL https://tailscale.com/install.sh | sh
           sudo tailscale up --authkey "${{ inputs.ts_authkey }}" --hostname "ubuntu-rdp" --accept-dns=true --accept-routes=true
-          echo "Tailscale IP: $(tailscale ip -4 | head -n1)"
+          tailscale ip -4 | head -n1 || true
 
-      - name: ⚙️ Optional Ngrok (TCP 3389)
+      - name: Ngrok TCP 3389 (optional)
         if: ${{ inputs.ngrok != '' }}
         shell: bash
         run: |
+          set -e
           RAW="${{ inputs.ngrok }}"
           TOK=$(echo "$RAW" | cut -d',' -f1)
           REG=$(echo "$RAW" | cut -d',' -f2)
@@ -123,10 +117,9 @@ EOF'
           ./ngrok authtoken "$TOK"
           nohup ./ngrok tcp 3389 --region "$REG" >/tmp/ngrok.log 2>&1 &
           sleep 8
-          echo "Ngrok URL(s):"
           curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[]?.public_url' || true
 
-      - name: 💻 Optional Chrome Remote Desktop
+      - name: Chrome Remote Desktop (optional)
         if: ${{ inputs.crd_code != '' }}
         shell: bash
         run: |
@@ -146,13 +139,12 @@ EOF'
             --pin="$PIN"
           sudo systemctl enable chrome-remote-desktop@$USERNAME
           sudo systemctl restart chrome-remote-desktop@$USERNAME
-          echo "✅ CRD started."
 
-      - name: 🕒 Keep alive ~6 hours
+      - name: Keep alive ~6 hours
         shell: bash
         run: |
           END=$(( $(date +%s) + 60 * $RUNTIME_MINUTES ))
           while [ $(date +%s) -lt $END ]; do
-            echo "💚 Live $(date +%T)"
+            echo "alive $(date +%T)"
             sleep 60
           done
