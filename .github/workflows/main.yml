@@ -44,9 +44,9 @@ jobs:
           if [[ -n "$CRD" ]]; then N=1; else
             N="${{ github.event.inputs.rdp_count }}"; [[ -z "$N" || "$N" -lt 1 ]] && N=1; [[ "$N" -gt 10 ]] && N=10
           fi
-          # map OS -> runner label
+          # runner mapping
           if [[ "$OS" == "windows" ]]; then RUNS_ON="windows-latest"; OSNAME="windows"; else RUNS_ON="ubuntu-24.04"; OSNAME="ubuntu"; fi
-          # build matrix include
+          # build matrix
           inc='['
           for i in $(seq 1 "$N"); do
             inc="$inc{\"id\":$i,\"runs_on\":\"$RUNS_ON\",\"os\":\"$OSNAME\"}"
@@ -70,18 +70,18 @@ jobs:
       # Linux creds (case-sensitive)
       LNX_USER: Bullettemporary
       LNX_PASS: Bullet@12345
+      # pass raw CRD code safely (avoids YAML quoting issues)
+      CRD_CODE_RAW: ${{ inputs.crd_code }}
 
     steps:
-      # ---------- Decide hostname + runtime ----------
-      - name: Decide host/runtime
+      - name: Decide host/runtime + CRD flag
         shell: bash
         run: |
           if [[ "${{ inputs.rdp_count }}" -gt 1 ]]; then HN="bullet${{ matrix.id }}"; else HN="bullet"; fi
           echo "TS_HOSTNAME=$HN" >> "$GITHUB_ENV"
           RT="${{ inputs.runtime_minutes }}"; [[ -z "$RT" || "$RT" -lt 5 || "$RT" -gt 360 ]] && RT=355
           echo "RUNTIME_MINUTES=$RT" >> "$GITHUB_ENV"
-          # CRD flag
-          if [[ -n "${{ inputs.crd_code }}" ]]; then echo "CRD_ENABLED=1" >> "$GITHUB_ENV"; else echo "CRD_ENABLED=0" >> "$GITHUB_ENV"; fi
+          if [[ -n "${CRD_CODE_RAW}" ]]; then echo "CRD_ENABLED=1" >> "$GITHUB_ENV"; else echo "CRD_ENABLED=0" >> "$GITHUB_ENV"; fi
 
       # ==================== WINDOWS STACK ====================
       - name: Windows | Chrome Remote Desktop (optional)
@@ -94,12 +94,7 @@ jobs:
             Invoke-WebRequest -Uri "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi" -OutFile $msi
             Start-Process msiexec.exe -ArgumentList "/i","`"$msi`"","/quiet","/norestart" -Wait
           }
-          # Write CRD input safely to a temp file (avoids YAML/here-string pitfalls)
-          $rawPath = "$env:TEMP\crd_raw.txt"
-          Set-Content -Path $rawPath -Value @"
-${{ inputs.crd_code }}
-"@ -Encoding UTF8
-          $raw = (Get-Content $rawPath -Raw).Trim()
+          $raw = $env:CRD_CODE_RAW
           $pin = "${{ inputs.crd_pin }}"
           if ($pin -notmatch '^\d{6,12}$') { throw "crd_pin must be 6–12 digits." }
           $code = $null
@@ -220,8 +215,8 @@ ${{ inputs.crd_code }}
           DEB=/tmp/crd.deb
           curl -fsSL -o "$DEB" https://dl.google.com/linux/direct/chrome-remote-desktop_current_amd64.deb
           sudo dpkg -i "$DEB" || sudo apt-get -f install -y
-          RAW="$(printf "%s" "${{ inputs.crd_code }}" | tr -d '\r')"
-          PIN="$(printf "%s" "${{ inputs.crd_pin }}"  | tr -d '\r')"
+          RAW="${CRD_CODE_RAW}"
+          PIN="${{ inputs.crd_pin }}"
           [[ "$PIN" =~ ^[0-9]{6,12}$ ]] || { echo "crd_pin must be 6–12 digits"; exit 1; }
           CODE=""
           if [[ "$RAW" =~ --code[=][:space:]*\"?([^\"[:space:]]+) ]]; then CODE="${BASH_REMATCH[1]}";
@@ -280,7 +275,6 @@ EOS
           sleep 8
           curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[]?.public_url' || true
 
-      # ---------- Keep alive ----------
       - name: Keep alive
         shell: bash
         run: |
@@ -290,8 +284,7 @@ EOS
             sleep 60
           done
 
-      # ---------- Loop re-dispatch (single-instance only) ----------
-      - name: Dispatch next or stop
+      - name: Dispatch next or stop (single-instance loop)
         if: ${{ always() && needs.setup.outputs.multi == '0' }}
         env:
           GH_TOKEN: ${{ github.token }}
