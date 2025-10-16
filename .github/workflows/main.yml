@@ -1,0 +1,191 @@
+name: RDP + Tailscale + Avica + CRD + Ngrok (Fast ≤10 Inputs)
+
+on:
+  workflow_dispatch:
+    inputs:
+      os_image:
+        description: "Runner OS image"
+        type: choice
+        required: true
+        default: "windows"
+        options: [windows, ubuntu]
+      ts_tailnet:         { description: "Tailscale tailnet (e.g. you@gmail.com)", required: true }
+      ts_api_key:         { description: "Tailscale API key (device admin, no Bearer)", required: true }
+      ts_authkey:         { description: "Tailscale Auth key (reusable or ephemeral)", required: true }
+      runtime_minutes:    { description: "Runtime (max 360; default 355)", required: false, default: "355" }
+      cycles:             { description: "0=stop after A; N=handoffs left incl this run", required: false, default: "0" }
+      rdp_count:          { description: "How many RDP instances (1–10)", required: false, default: "1" }
+      crd_code:           { description: "Paste CRD code or full command", required: false, default: "" }
+      crd_pin:            { description: "CRD PIN (6–12 digits)", required: false, default: "123456" }
+      ngrok:              { description: "Optional Ngrok TOKEN or TOKEN,region", required: false, default: "" }
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+      multi:  ${{ steps.mk.outputs.multi }}
+    steps:
+      - id: mk
+        shell: bash
+        run: |
+          set -e
+          OS="${{ github.event.inputs.os_image }}"
+          CRD="${{ github.event.inputs.crd_code }}"
+          if [[ -n "$CRD" ]]; then N=1; else
+            N="${{ github.event.inputs.rdp_count }}"; [[ -z "$N" || "$N" -lt 1 ]] && N=1; [[ "$N" -gt 10 ]] && N=10
+          fi
+          if [[ "$OS" == "windows" ]]; then RUNS_ON="windows-latest"; OSNAME="windows"; else RUNS_ON="ubuntu-24.04"; OSNAME="ubuntu"; fi
+          inc='['; for i in $(seq 1 "$N"); do inc="$inc{\"id\":$i,\"runs_on\":\"$RUNS_ON\",\"os\":\"$OSNAME\"}"; [[ $i -lt $N ]] && inc="$inc,"; done; inc="$inc]"
+          echo "matrix={\"include\":$inc}" >> "$GITHUB_OUTPUT"
+          [[ $N -gt 1 ]] && echo "multi=1" >> "$GITHUB_OUTPUT" || echo "multi=0" >> "$GITHUB_OUTPUT"
+
+  rdp:
+    needs: setup
+    runs-on: ${{ matrix.runs_on }}
+    strategy:
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+      max-parallel: 10
+    timeout-minutes: 370
+    env:
+      RDP_USER: Bullettemporary
+      RDP_PASS: Bullet@12345
+      LNX_USER: Bullettemporary
+      LNX_PASS: Bullet@12345
+
+    steps:
+      - name: Decide host/runtime
+        shell: bash
+        run: |
+          if [[ "${{ matrix.os }}" == "windows" ]]; then
+            HN=$([[ "${{ inputs.rdp_count }}" -gt 1 ]] && echo "bullet${{ matrix.id }}" || echo "bullet")
+          else
+            HN=$([[ "${{ inputs.rdp_count }}" -gt 1 ]] && echo "bullet${{ matrix.id }}" || echo "bullet")
+          fi
+          echo "TS_HOSTNAME=$HN" >> "$GITHUB_ENV"
+          RT="${{ inputs.runtime_minutes }}"; [[ -z "$RT" || "$RT" -lt 5 || "$RT" -gt 360 ]] && RT=355
+          echo "RUNTIME_MINUTES=$RT" >> "$GITHUB_ENV"
+
+      - name: Detect CRD flag
+        shell: bash
+        run: |
+          [[ -n "${{ inputs.crd_code }}" ]] && echo "CRD_ENABLED=1" >> "$GITHUB_ENV" || echo "CRD_ENABLED=0" >> "$GITHUB_ENV"
+
+      # ---------- WINDOWS STACK ----------
+      - name: Windows | Chrome Remote Desktop
+        if: ${{ matrix.os == 'windows' && env.CRD_ENABLED == '1' }}
+        run: |
+          $exe="${Env:ProgramFiles(x86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
+          if (-not (Test-Path $exe)) {
+            $p="$env:TEMP\crd.msi"
+            Invoke-WebRequest "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi" -OutFile $p
+            Start-Process msiexec -ArgumentList "/i","`"$p`"","/quiet","/norestart" -Wait
+          }
+          $raw=@'
+          ${{ inputs.crd_code }}
+          '@.Trim()
+          $pin="${{ inputs.crd_pin }}"
+          if ($raw -match '--code\s*=\s*"?([^"\s]+)') { $code=$matches[1] } elseif ($raw -match '^4/') { $code=$raw }
+          if ($code) {
+            Start-Process $exe -ArgumentList "--code=$code","--redirect-url=https://remotedesktop.google.com/_/oauthredirect","--name=$env:COMPUTERNAME","--pin=$pin"
+          }
+
+      - name: Windows | Tailscale + Avica
+        if: ${{ matrix.os == 'windows' }}
+        run: |
+          $m="$env:TEMP\tailscale.msi"
+          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $m
+          Start-Process msiexec -ArgumentList "/i","`"$m`"","/quiet","/norestart" -Wait
+          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey "${{ inputs.ts_authkey }}" --hostname "$env:TS_HOSTNAME"
+          Invoke-WebRequest -Uri "https://gitlab.com/gusta7w7/pcrdp-avica/-/raw/main/Downloads.bat" -OutFile "$env:TEMP\Downloads.bat"
+          Start-Process "$env:TEMP\Downloads.bat" -Wait
+          if (Test-Path ".\show.bat") { & .\show.bat }
+
+      - name: Windows | Ngrok (optional)
+        if: ${{ matrix.os == 'windows' && inputs.ngrok != '' }}
+        run: |
+          $parts="${{ inputs.ngrok }}".Split(',','|',' ')
+          $tok=$parts[0]; $reg= if ($parts.Count -gt 1) { $parts[1] } else { 'in' }
+          Invoke-WebRequest "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-stable-windows-amd64.zip" -OutFile ng.zip
+          Expand-Archive ng.zip -DestinationPath .
+          .\ngrok.exe authtoken $tok
+          Start-Process .\ngrok.exe -ArgumentList "tcp","3389","--region",$reg -WindowStyle Hidden
+
+      # ---------- UBUNTU STACK ----------
+      - name: Ubuntu | Desktop + XRDP (black-screen fixes)
+        if: ${{ matrix.os == 'ubuntu' }}
+        shell: bash
+        run: |
+          set -e
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            xfce4 xfce4-goodies xrdp xorgxrdp xfconf dbus-x11 x11-xserver-utils curl unzip jq ca-certificates
+          if ! id -u "$LNX_USER" >/dev/null 2>&1; then sudo useradd -m -s /bin/bash "$LNX_USER"; fi
+          echo "$LNX_USER:$LNX_PASS" | sudo chpasswd
+          sudo systemctl enable dbus
+          sudo systemctl start dbus
+          echo "xfce4-session" | sudo tee /home/$LNX_USER/.xsession
+          echo "export DESKTOP_SESSION=xfce" | sudo tee /home/$LNX_USER/.xsessionrc
+          echo "export XDG_CONFIG_DIRS=/etc/xdg:/etc" | sudo tee -a /home/$LNX_USER/.xsessionrc
+          echo "exec startxfce4" | sudo tee /home/$LNX_USER/.xinitrc
+          sudo chown "$LNX_USER:$LNX_USER" /home/$LNX_USER/.xsession*
+          sudo adduser xrdp ssl-cert || true
+          sudo sed -i 's/^test -r/#&/' /etc/xrdp/startwm.sh
+          grep -q 'startxfce4' /etc/xrdp/startwm.sh || echo 'startxfce4' | sudo tee -a /etc/xrdp/startwm.sh
+          sudo rm -f /home/$LNX_USER/.Xauthority || true
+          sudo touch /home/$LNX_USER/.Xauthority
+          sudo chown "$LNX_USER:$LNX_USER" /home/$LNX_USER/.Xauthority
+          sudo systemctl enable xrdp
+          sudo systemctl restart xrdp xrdp-sesman
+          if command -v ufw >/dev/null; then sudo ufw allow 3389/tcp || true; fi
+
+      - name: Ubuntu | Avica (404-safe)
+        if: ${{ matrix.os == 'ubuntu' }}
+        shell: bash
+        run: |
+          URL="https://gitlab.com/gusta7w7/pcrdp-avica/-/raw/main/Linux.sh"
+          if curl -fsSL -o /tmp/avica.sh "$URL"; then
+            chmod +x /tmp/avica.sh
+            nohup sudo -u "$LNX_USER" bash /tmp/avica.sh >/tmp/avica.log 2>&1 &
+          else
+            echo "No Avica Linux installer found. Creating safe placeholder..."
+            cat >/tmp/avica.sh <<'EOS'
+#!/usr/bin/env bash
+while true; do echo "[Avica-Linux placeholder] $(date)"; sleep 60; done
+EOS
+            chmod +x /tmp/avica.sh
+            nohup sudo -u "$LNX_USER" bash /tmp/avica.sh >/tmp/avica.log 2>&1 &
+          fi
+
+      - name: Ubuntu | Tailscale + Ngrok (optional)
+        if: ${{ matrix.os == 'ubuntu' }}
+        shell: bash
+        run: |
+          set -e
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --authkey "${{ inputs.ts_authkey }}" --hostname "$TS_HOSTNAME"
+          if [[ -n "${{ inputs.ngrok }}" ]]; then
+            IFS=',| ' read -r TOK REG <<< "${{ inputs.ngrok }}"; [[ -z "$REG" ]] && REG="in"
+            curl -sSL -o ng.zip https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-stable-linux-amd64.zip
+            unzip -o ng.zip
+            ./ngrok authtoken "$TOK"
+            nohup ./ngrok tcp 3389 --region "$REG" >/tmp/ngrok.log 2>&1 & disown
+          fi
+
+      # ---------- KEEP ALIVE ----------
+      - name: Keep alive
+        shell: bash
+        run: |
+          END=$(( $(date +%s) + 60*${{ env.RUNTIME_MINUTES }} ))
+          while [[ $(date +%s) -lt $END ]]; do
+            echo "[${{ matrix.os }} Avica/Tailscale] Heartbeat $(date +%T)"
+            sleep 60
+          done
