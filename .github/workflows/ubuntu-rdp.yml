@@ -1,4 +1,4 @@
-name: Ubuntu VNC Desktop (Jammy – XFCE + noVNC + Python)
+name: Ubuntu VNC Desktop (Jammy – XFCE + noVNC + Cloudflare + Python)
 
 on:
   workflow_dispatch:
@@ -32,25 +32,21 @@ jobs:
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             xfce4 xfce4-goodies dbus-x11 dbus-user-session x11-xserver-utils \
-            tigervnc-standalone-server tigervnc-common novnc websockify \
-            curl jq unzip xorg locales
+            tigervnc-standalone-server tigervnc-common tigervnc-tools \
+            novnc websockify curl jq unzip xorg locales
 
-          # Locale
           sudo locale-gen en_US.UTF-8
           echo 'LANG=en_US.UTF-8' | sudo tee /etc/default/locale >/dev/null
 
-          # Create desktop user
           if ! id -u "$USERNAME" >/dev/null 2>&1; then
             sudo useradd -m -s /bin/bash "$USERNAME"
           fi
           echo "$USERNAME:$PASSWORD" | sudo chpasswd
           echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/$USERNAME >/dev/null
 
-          # Ensure user runtime dir (for user D-Bus)
           U=$(id -u "$USERNAME")
           sudo install -d -m 700 -o "$USERNAME" -g "$USERNAME" "/run/user/$U"
 
-          # Write VNC xstartup that launches XFCE under dbus-run-session
           sudo -u "$USERNAME" mkdir -p /home/$USERNAME/.vnc
           sudo bash -c 'printf "%s\n" \
             "#!/bin/sh" \
@@ -61,80 +57,52 @@ jobs:
             "export XDG_CONFIG_DIRS=/etc/xdg:/etc" \
             "export DESKTOP_SESSION=xfce" \
             "export XDG_CURRENT_DESKTOP=XFCE" \
-            "" \
-            "# Start XFCE inside a fresh user D-Bus session" \
             "exec dbus-run-session -- startxfce4" \
             > /home/'"$USERNAME"'/.vnc/xstartup'
           sudo chmod +x /home/$USERNAME/.vnc/xstartup
           sudo chown -R "$USERNAME:$USERNAME" /home/$USERNAME/.vnc
 
-          # Set VNC password (TigerVNC uses only the first 8 chars)
           VPASS="${{ inputs.vnc_password }}"
           [ -z "$VPASS" ] && VPASS="vnc12345"
-          echo "$VPASS" | head -c 8 | sudo -u "$USERNAME" vncpasswd -f > /home/$USERNAME/.vnc/passwd
+          echo "$VPASS" | head -c 8 | sudo -u "$USERNAME" bash -c "vncpasswd -f > /home/$USERNAME/.vnc/passwd"
           sudo chmod 600 /home/$USERNAME/.vnc/passwd
 
-          # Start the VNC server
           sudo -u "$USERNAME" vncserver "$VNC_DISPLAY" -geometry "$VNC_GEOMETRY" -depth "$VNC_DEPTH"
-
-          # Start noVNC (web client) on :6080 -> proxies to localhost 5901
-          # novnc package provides 'websockify' and '/usr/share/novnc'
           nohup websockify --web=/usr/share/novnc 6080 localhost 5901 >/tmp/novnc.log 2>&1 &
 
-          # Show endpoints
-          echo "VNC server running on TCP 5901 (display $VNC_DISPLAY)"
-          echo "noVNC running on http://127.0.0.1:6080/ (will be tunneled if enabled)"
+          echo "✅ VNC server on 5901; noVNC on http://127.0.0.1:6080/"
 
       - name: Optional – Expose noVNC via Cloudflare (no account needed)
         if: ${{ inputs.expose_with_cloudflared == 'true' }}
         shell: bash
         run: |
           set -e
-          # Download a static cloudflared
           curl -sSL -o /tmp/cloudflared.tgz https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.tgz
           tar -xzf /tmp/cloudflared.tgz -C /tmp
           chmod +x /tmp/cloudflared
-
-          # Start a tunnel to local noVNC (port 6080). 'trycloudflare.com' gives a random URL.
           nohup /tmp/cloudflared tunnel --url http://localhost:6080 >/tmp/cloudflared.log 2>&1 &
-
-          # Wait and print the public URL
           for i in {1..20}; do
             URL=$(grep -Eo 'https://[-a-z0-9.]+trycloudflare.com' /tmp/cloudflared.log | tail -n1 || true)
-            if [ -n "$URL" ]; then
-              echo "PUBLIC_NOVNC_URL=$URL" | tee -a $GITHUB_ENV
-              echo "noVNC public URL: $URL"
-              break
-            fi
+            [ -n "$URL" ] && echo "PUBLIC_NOVNC_URL=$URL" | tee -a $GITHUB_ENV && echo "🌐 $URL" && break
             sleep 2
           done
-          if [ -z "$URL" ]; then
-            echo "Could not detect Cloudflare URL. Check /tmp/cloudflared.log"
-          fi
 
       - name: Install Python 3 + pip
         shell: bash
         run: |
-          set -e
           sudo apt-get update
           sudo apt-get install -y python3 python3-pip python3-venv python3-dev build-essential
           python3 -m pip install --upgrade pip wheel setuptools
-          python3 --version && pip3 --version
 
       - name: Connection info
         shell: bash
         run: |
           echo "---------------------------------------------"
-          echo "VNC connection:"
-          echo "  Host: 127.0.0.1 (direct inbound not reachable on GitHub runners)"
-          echo "  Port: 5901"
-          echo "  Password: (first 8 chars of your input) -> '${{ inputs.vnc_password }}'"
-          echo
-          echo "noVNC (browser) local:  http://127.0.0.1:6080/"
+          echo "User: $USERNAME / Pass: $PASSWORD"
+          echo "VNC password: (first 8 chars) '${{ inputs.vnc_password }}'"
+          echo "noVNC local:  http://127.0.0.1:6080/"
           if [ -n "${PUBLIC_NOVNC_URL:-}" ]; then
-            echo "noVNC (public): ${PUBLIC_NOVNC_URL}"
-          else
-            echo "noVNC public URL not available (Cloudflare disabled or failed)."
+            echo "noVNC public: ${PUBLIC_NOVNC_URL}"
           fi
           echo "---------------------------------------------"
 
