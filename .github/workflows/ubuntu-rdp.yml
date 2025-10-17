@@ -1,4 +1,4 @@
-name: Ubuntu 22.04 RDP (6 hours, stable)
+name: Ubuntu 22.04 RDP (6h, fixed, with Python)
 
 on:
   workflow_dispatch:
@@ -30,13 +30,18 @@ jobs:
       RUNTIME_MINUTES: 355
 
     steps:
-      - name: Install XFCE + XRDP (Jammy-stable)
+      - name: Install XFCE + XRDP and patch startwm.sh
         shell: bash
         run: |
           set -e
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            xfce4 xfce4-goodies xrdp xorgxrdp dbus-x11 x11-xserver-utils curl jq unzip
+            xfce4 xfce4-goodies xrdp xorgxrdp xfconf dbus-x11 x11-xserver-utils \
+            policykit-1 gvfs xorg locales curl jq unzip
+
+          # Locale
+          sudo locale-gen en_US.UTF-8
+          echo 'LANG=en_US.UTF-8' | sudo tee /etc/default/locale >/dev/null
 
           # Create RDP user
           if ! id -u "$USERNAME" >/dev/null 2>&1; then
@@ -45,15 +50,70 @@ jobs:
           echo "$USERNAME:$PASSWORD" | sudo chpasswd
           echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/$USERNAME >/dev/null
 
-          # XRDP session for this user
+          # Per-user XRDP session
           echo "xfce4-session" | sudo tee /home/$USERNAME/.xsession >/dev/null
           sudo chown "$USERNAME:$USERNAME" /home/$USERNAME/.xsession
 
+          # Allow xrdp to start Xorg
+          echo "allowed_users=anybody" | sudo tee /etc/X11/Xwrapper.config >/dev/null
+
+          # Ensure system dbus is up
+          sudo systemctl enable dbus
+          sudo systemctl start dbus
+
+          # Ensure XDG path contains /etc
+          if ! grep -q '^XDG_CONFIG_DIRS=' /etc/environment; then
+            echo 'XDG_CONFIG_DIRS=/etc/xdg:/etc' | sudo tee -a /etc/environment >/dev/null
+          fi
+
+          # Ensure user Xauthority exists
+          sudo -u "$USERNAME" touch "/home/$USERNAME/.Xauthority"
+          sudo chown "$USERNAME:$USERNAME" "/home/$USERNAME/.Xauthority"
+
+          # Write dbus-aware startwm.sh using printf (YAML-safe)
+          sudo bash -c 'printf "%s\n" \
+            "#!/bin/bash" \
+            "export LANG=en_US.UTF-8" \
+            "export LC_ALL=en_US.UTF-8" \
+            "export XDG_CONFIG_DIRS=/etc/xdg:/etc" \
+            "export XDG_DATA_DIRS=/usr/share:/usr/local/share" \
+            "export DESKTOP_SESSION=xfce" \
+            "export XDG_CURRENT_DESKTOP=XFCE" \
+            "unset DBUS_SESSION_BUS_ADDRESS" \
+            "" \
+            "# ensure per-user runtime directory" \
+            "[ -z \"\\$XDG_RUNTIME_DIR\" ] && export XDG_RUNTIME_DIR=/run/user/\\$(id -u)" \
+            "[ -d \"\\$XDG_RUNTIME_DIR\" ] || mkdir -p \"\\$XDG_RUNTIME_DIR\"" \
+            "chmod 700 \"\\$XDG_RUNTIME_DIR\" || true" \
+            "" \
+            "# start a clean D-Bus session and XFCE" \
+            "eval \"\\$(dbus-launch --exit-with-session --sh-syntax)\"" \
+            "exec /usr/bin/startxfce4" \
+            > /etc/xrdp/startwm.sh'
+          sudo chmod +x /etc/xrdp/startwm.sh
+
           # Enable and start XRDP
+          sudo adduser xrdp ssl-cert || true
           sudo systemctl enable xrdp
           sudo systemctl restart xrdp xrdp-sesman
 
           echo "XRDP ready: user=$USERNAME pass=$PASSWORD port=3389"
+
+      - name: Install Python toolchain
+        shell: bash
+        run: |
+          set -e
+          sudo apt-get update
+          # Core Python 3.10 on Jammy + dev headers and build tools
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            python3 python3-pip python3-venv python3-dev build-essential pkg-config \
+            libffi-dev libssl-dev libjpeg-turbo8-dev zlib1g-dev
+          python3 -m pip install --upgrade pip wheel setuptools
+          # Optionally preinstall some common libs (uncomment if you want)
+          # python3 -m pip install numpy pandas matplotlib pillow
+
+          echo "Python: $(python3 --version)"
+          echo "Pip: $(python3 -m pip --version)"
 
       - name: Optional - Tailscale
         if: ${{ inputs.ts_authkey != '' }}
@@ -92,8 +152,7 @@ jobs:
           CODE_RAW="${{ inputs.crd_code }}"
           PIN="${{ inputs.crd_pin }}"
           echo "$PIN" | grep -Eq '^[0-9]{6,12}$' || { echo "Invalid CRD PIN"; exit 1; }
-          # Extract a 4/... token if full command/URL was pasted
-          CODE=$(echo "$CODE_RAW" | grep -o '4/[^" ]*' | head -n1)
+          CODE=$(echo "$CODE_RAW" | grep -o '4/[^\" ]*' | head -n1)
           [ -z "$CODE" ] && { echo "No CRD code detected"; exit 1; }
           sudo -u "$USERNAME" /opt/google/chrome-remote-desktop/start-host \
             --code="$CODE" \
