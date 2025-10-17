@@ -1,4 +1,4 @@
-name: GNOME + Tailscale + VNC and xRDP (No Secrets, Clean v4)
+name: Xfce + Tailscale + VNC and xRDP (No Secrets)
 
 on:
   workflow_dispatch:
@@ -51,7 +51,7 @@ jobs:
       VNC_DISPLAY_IN: ${{ inputs.vnc_display }}
       VNC_GEOMETRY_IN: ${{ inputs.vnc_geometry }}
       RUNTIME_MINUTES_IN: ${{ inputs.runtime_minutes }}
-      HOSTNAME: gh-gnome-${{ github.run_id }}
+      HOSTNAME: xfce-${{ github.run_id }}
 
     steps:
       - name: Checkout
@@ -84,17 +84,24 @@ jobs:
           if ! [[ "$geom" =~ ^[0-9]+x[0-9]+$ ]]; then geom="1366x768"; fi
           echo "vnc_geometry=$geom" >> "$GITHUB_OUTPUT"
 
-      - name: Prepare user and desktop packages
+      - name: Prepare user and base packages
         shell: bash
         run: |
           set -euxo pipefail
           echo "${USERNAME}:${PASSWORD}" | sudo chpasswd
           echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/${USERNAME} >/dev/null
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends xorg dbus-x11 gnome-session gnome-terminal gsettings-desktop-schemas policykit-1 x11-xserver-utils fonts-dejavu-core
+          sudo apt-get install -y --no-install-recommends xorg dbus-x11 x11-xserver-utils fonts-dejavu-core
           sudo apt-get install -y curl jq net-tools psmisc lsof
 
-      - name: Install and configure xRDP
+      - name: Install Xfce desktop
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y xfce4 xfce4-goodies
+
+      - name: Install and configure xRDP (Xfce)
         if: ${{ steps.cfg.outputs.enable_xrdp == 'true' }}
         shell: bash
         env:
@@ -105,20 +112,20 @@ jobs:
           sudo apt-get install -y xrdp xorgxrdp
           sudo adduser "${USER_LOGIN}" ssl-cert || true
 
-          # Default GNOME session for RDP logins
-          sudo -u "${USER_LOGIN}" bash -lc 'printf "%s\n" "gnome-session --session=ubuntu" > ~/.xsession'
+          # Make Xfce the session for RDP logins
+          sudo -u "${USER_LOGIN}" bash -lc 'printf "%s\n" "startxfce4" > ~/.xsession'
 
-          # Avoid black screen; ensure GNOME starts
+          # Make sure startwm.sh launches Xfce and not the default session
           sudo sed -i 's/^test -r/#&/' /etc/xrdp/startwm.sh
           printf "%s\n" "unset DBUS_SESSION_BUS_ADDRESS" | sudo tee -a /etc/xrdp/startwm.sh >/dev/null
           printf "%s\n" "unset XDG_RUNTIME_DIR"        | sudo tee -a /etc/xrdp/startwm.sh >/dev/null
-          printf "%s\n" "gnome-session --session=ubuntu &" | sudo tee -a /etc/xrdp/startwm.sh >/dev/null
+          printf "%s\n" "startxfce4 &"                 | sudo tee -a /etc/xrdp/startwm.sh >/dev/null
           printf "%s\n" "wait"                          | sudo tee -a /etc/xrdp/startwm.sh >/dev/null
 
           sudo systemctl enable xrdp || true
           sudo systemctl restart xrdp || true
 
-      - name: Install and configure TigerVNC
+      - name: Install and configure TigerVNC (Xfce)
         if: ${{ steps.cfg.outputs.enable_vnc == 'true' }}
         shell: bash
         env:
@@ -136,11 +143,11 @@ jobs:
           sudo -u "${USER_LOGIN}" bash -lc "printf '%s\n%s\n\n' '${VNC_PASS}' '${VNC_PASS}' | vncpasswd"
           sudo -u "${USER_LOGIN}" chmod 600 "/home/${USER_LOGIN}/.vnc/passwd"
 
-          # Write xstartup for GNOME (no heredoc)
+          # xstartup for Xfce (no heredoc to avoid YAML issues)
           sudo -u "${USER_LOGIN}" bash -lc 'printf "%s\n" "#!/bin/sh" > ~/.vnc/xstartup'
           sudo -u "${USER_LOGIN}" bash -lc 'printf "%s\n" "unset SESSION_MANAGER" >> ~/.vnc/xstartup'
           sudo -u "${USER_LOGIN}" bash -lc 'printf "%s\n" "unset DBUS_SESSION_BUS_ADDRESS" >> ~/.vnc/xstartup'
-          sudo -u "${USER_LOGIN}" bash -lc 'printf "%s\n" "exec gnome-session --session=ubuntu &" >> ~/.vnc/xstartup'
+          sudo -u "${USER_LOGIN}" bash -lc 'printf "%s\n" "startxfce4 &" >> ~/.vnc/xstartup'
           sudo -u "${USER_LOGIN}" chmod +x "/home/${USER_LOGIN}/.vnc/xstartup"
 
           # Restart VNC server on chosen display
@@ -172,7 +179,7 @@ jobs:
           ts_ip4="$(tailscale ip -4 | head -n1 || true)"
           ts_ip6="$(tailscale ip -6 | head -n1 || true)"
           vnc_port=$((5900 + DISP))
-          echo "GNOME Desktop is ready"
+          echo "Xfce Desktop is ready"
           echo "User: ${USER_LOGIN} | Password: (hidden)"
           echo "Tailscale IPv4: ${ts_ip4}"
           echo "Tailscale IPv6: ${ts_ip6}"
