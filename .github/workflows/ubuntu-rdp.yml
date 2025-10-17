@@ -15,7 +15,7 @@ on:
         required: false
         default: "runner"
       desktop:
-        description: "Desktop (gnome=stable flashback, gnome-classic, xfce)"
+        description: "Desktop (gnome=flashback, gnome-classic, xfce)"
         type: choice
         options: [gnome, gnome-classic, xfce]
         default: "gnome"
@@ -46,54 +46,78 @@ jobs:
           echo "${USERNAME}:${PASSWORD}" | sudo chpasswd
           echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/${USERNAME}
 
-      - name: Install base desktop bits (GNOME or XFCE) + VNC
+      - name: Install desktop + TigerVNC (with GNOME fixes)
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-
-          # Always install TigerVNC server + helpers
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             tigervnc-standalone-server tigervnc-common tigervnc-tools \
-            dbus-x11 xorg
+            dbus-x11 xorg x11-xserver-utils
 
           if [ "${DESKTOP}" = "xfce" ]; then
             sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
               xfce4 xfce4-goodies
-            echo "exec startxfce4" | sudo tee /home/${USERNAME}/.xsession >/dev/null
+            SESSION_CMD='startxfce4'
           else
-            # Official GNOME stack
+            # GNOME stack + Flashback (Metacity) for headless reliability
             sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
               gnome-session gnome-shell gnome-terminal gnome-control-center \
-              gdm3 gnome-tweaks gnome-shell-extension-prefs
+              gdm3 gnome-session-flashback gnome-panel metacity nautilus \
+              gnome-tweaks gnome-shell-extension-prefs
 
-            # Headless stability: use Xorg, disable Wayland and shell extensions, software-friendly settings
+            # Force Xorg (no Wayland)
             sudo sed -i 's/^#\?WaylandEnable=.*/WaylandEnable=false/' /etc/gdm3/custom.conf || true
-            sudo bash -lc "mkdir -p /home/${USERNAME}/.config"
 
-            # Disable user extensions, animations, idle, etc. (prevents 'Oh no!' crashes)
-            sudo -u ${USERNAME} dbus-launch gsettings set org.gnome.shell disable-user-extensions true
-            sudo -u ${USERNAME} dbus-launch gsettings set org.gnome.desktop.interface enable-animations false
-            sudo -u ${USERNAME} dbus-launch gsettings set org.gnome.desktop.session idle-delay 0
-            sudo -u ${USERNAME} dbus-launch gsettings set org.gnome.mutter check-alive-timeout 0
-
+            # Desktop choice
             if [ "${DESKTOP}" = "gnome-classic" ]; then
-              # GNOME Flashback (metacity) is very robust in virtual/CPU rendering
-              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gnome-session-flashback
-              echo "exec dbus-launch gnome-session --session=gnome-flashback-metacity" | sudo tee /home/${USERNAME}/.xsession >/dev/null
+              SESSION_CMD='dbus-launch gnome-session --session=gnome-classic'
             else
-              # Default 'gnome' option -> also use Flashback (stable) while remaining GNOME
-              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gnome-session-flashback
-              echo "exec dbus-launch gnome-session --session=gnome-flashback-metacity" | sudo tee /home/${USERNAME}/.xsession >/dev/null
+              # default "gnome" uses Flashback Metacity
+              SESSION_CMD='dbus-launch gnome-session --session=gnome-flashback-metacity'
             fi
+
+            # Hardening to avoid “Oh no!”: kill animations & extensions in headless env
+            sudo -u ${USERNAME} dbus-launch gsettings set org.gnome.shell disable-user-extensions true || true
+            sudo -u ${USERNAME} dbus-launch gsettings set org.gnome.desktop.interface enable-animations false || true
+            sudo -u ${USERNAME} dbus-launch gsettings set org.gnome.desktop.session idle-delay 0 || true
+            sudo -u ${USERNAME} dbus-launch gsettings set org.gnome.mutter check-alive-timeout 0 || true
           fi
 
-          sudo chown ${USERNAME}:${USERNAME} /home/${USERNAME}/.xsession
-
-          # VNC password
+          # VNC password and Xauth
           sudo -u ${USERNAME} mkdir -p /home/${USERNAME}/.vnc
           echo "${PASSWORD}" | vncpasswd -f | sudo tee /home/${USERNAME}/.vnc/passwd >/dev/null
           sudo chmod 600 /home/${USERNAME}/.vnc/passwd
-          sudo chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}/.vnc
+          sudo touch /home/${USERNAME}/.Xauthority
+          sudo chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}/.vnc /home/${USERNAME}/.Xauthority
+
+          # Robust xstartup to prevent black screen
+          cat <<'EOF' | sudo tee /home/${USERNAME}/.vnc/xstartup >/dev/null
+          #!/bin/sh
+          unset SESSION_MANAGER
+          unset DBUS_SESSION_BUS_ADDRESS
+
+          # XDG runtime dir is required by GNOME components
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          mkdir -p "$XDG_RUNTIME_DIR"; chmod 700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
+
+          export XDG_SESSION_TYPE=x11
+          export XDG_CONFIG_DIRS=/etc/xdg
+          export XAUTHORITY="$HOME/.Xauthority"
+          xrdb -merge "$HOME/.Xresources" 2>/dev/null || true
+
+          # Start a D-Bus session and the chosen desktop
+          if command -v gnome-session >/dev/null 2>&1; then
+            # GNOME/Flashback path
+            exec ${SESSION_CMD}
+          else
+            # Fallback to XFCE if GNOME not present
+            exec startxfce4
+          fi
+          EOF
+          sudo chmod +x /home/${USERNAME}/.vnc/xstartup
+          # Also provide .xsession for completeness (not used by TigerVNC but harmless)
+          echo "exec ${SESSION_CMD:-startxfce4}" | sudo tee /home/${USERNAME}/.xsession >/dev/null
+          sudo chown ${USERNAME}:${USERNAME} /home/${USERNAME}/.xsession
 
       - name: Install + bring up Tailscale
         run: |
@@ -105,11 +129,10 @@ jobs:
       - name: Start TigerVNC on :1 (5901)
         run: |
           set -euo pipefail
-          # Start a clean VNC session reachable over the private Tailscale IP
           sudo -u ${USERNAME} vncserver -kill :1 >/dev/null 2>&1 || true
-          sudo -u ${USERNAME} vncserver :1 -geometry 1280x800 -depth 24 -localhost no
-          sleep 2
-          # Show processes
+          # Start with our xstartup (ensures desktop session starts), listen on all IFs
+          sudo -u ${USERNAME} vncserver :1 -geometry 1280x800 -depth 24 -localhost no -xstartup /home/${USERNAME}/.vnc/xstartup
+          sleep 3
           pgrep -a Xvnc || true
 
       - name: Connection info
@@ -122,7 +145,7 @@ jobs:
           echo "VNC       : Enabled (port 5901, display :1)"
           echo "VNC pass  : ${PASSWORD}"
           echo "Tailscale : ${TS4}:5901"
-          echo "Tip: use any VNC client to connect to the Tailscale IP."
+          echo "Use any VNC client -> Tailscale IPv4 above."
           echo "----------------------------------------------------"
 
       - name: Keep alive (~6 hours)
