@@ -1,4 +1,4 @@
-name: Ubuntu RDP 6h Stable
+name: Ubuntu 22.04 RDP (6 hours, stable)
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
         required: false
         default: ""
       ngrok:
-        description: "Ngrok TOKEN or TOKEN,region (optional)"
+        description: "Ngrok TOKEN or TOKEN,region (optional: us,in,eu,ap,au,sa,jp)"
         required: false
         default: ""
       crd_code:
@@ -22,7 +22,7 @@ on:
 
 jobs:
   ubuntu_rdp:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 370
     env:
       USERNAME: Bullettemporary
@@ -30,96 +30,58 @@ jobs:
       RUNTIME_MINUTES: 355
 
     steps:
-      - name: Install desktop + XRDP (dbus/polkit fixes)
+      - name: Install XFCE + XRDP (Jammy-stable)
         shell: bash
         run: |
           set -e
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            xfce4 xfce4-goodies xrdp xorgxrdp xfconf dbus-x11 x11-xserver-utils \
-            policykit-1 gvfs xorg locales curl jq unzip
+            xfce4 xfce4-goodies xrdp xorgxrdp dbus-x11 x11-xserver-utils curl jq unzip
 
-          # Locale
-          sudo locale-gen en_US.UTF-8
-          echo 'LANG=en_US.UTF-8' | sudo tee /etc/default/locale >/dev/null
-
-          # RDP user
+          # Create RDP user
           if ! id -u "$USERNAME" >/dev/null 2>&1; then
             sudo useradd -m -s /bin/bash "$USERNAME"
           fi
           echo "$USERNAME:$PASSWORD" | sudo chpasswd
           echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/$USERNAME >/dev/null
 
-          # Allow xrdp to start Xorg
-          echo "allowed_users=anybody" | sudo tee /etc/X11/Xwrapper.config >/dev/null
+          # XRDP session for this user
+          echo "xfce4-session" | sudo tee /home/$USERNAME/.xsession >/dev/null
+          sudo chown "$USERNAME:$USERNAME" /home/$USERNAME/.xsession
 
-          # System dbus
-          sudo systemctl enable dbus
-          sudo systemctl start dbus
-
-          # XDG path
-          if ! grep -q '^XDG_CONFIG_DIRS=' /etc/environment; then
-            echo 'XDG_CONFIG_DIRS=/etc/xdg:/etc' | sudo tee -a /etc/environment >/dev/null
-          fi
-
-          # Ensure .Xauthority
-          sudo -u "$USERNAME" touch "/home/$USERNAME/.Xauthority"
-          sudo chown "$USERNAME:$USERNAME" "/home/$USERNAME/.Xauthority"
-
-          # Write minimal startwm.sh WITHOUT heredoc (prevents YAML issues)
-          sudo bash -c 'printf "%s\n" \
-            "#!/bin/sh" \
-            "export LANG=en_US.UTF-8" \
-            "export LC_ALL=en_US.UTF-8" \
-            "export XDG_CONFIG_DIRS=/etc/xdg:/etc" \
-            "export DESKTOP_SESSION=xfce" \
-            "export XDG_CURRENT_DESKTOP=XFCE" \
-            "unset DBUS_SESSION_BUS_ADDRESS" \
-            "[ -z \"\$XDG_RUNTIME_DIR\" ] && export XDG_RUNTIME_DIR=/run/user/\$(id -u)" \
-            "[ -d \"\$XDG_RUNTIME_DIR\" ] || mkdir -p \"\$XDG_RUNTIME_DIR\"" \
-            "chmod 700 \"\$XDG_RUNTIME_DIR\" || true" \
-            "eval \"\$(dbus-launch --sh-syntax)\"" \
-            "exec startxfce4" > /etc/xrdp/startwm.sh'
-          sudo chmod +x /etc/xrdp/startwm.sh
-
-          # Per-user defaults
-          echo "exec startxfce4" | sudo tee /home/$USERNAME/.xsession >/dev/null
-          echo "exec startxfce4" | sudo tee /home/$USERNAME/.xinitrc >/dev/null
-          sudo chown "$USERNAME:$USERNAME" /home/$USERNAME/.xsession /home/$USERNAME/.xinitrc
-
-          # Enable XRDP
-          sudo adduser xrdp ssl-cert || true
+          # Enable and start XRDP
           sudo systemctl enable xrdp
           sudo systemctl restart xrdp xrdp-sesman
 
           echo "XRDP ready: user=$USERNAME pass=$PASSWORD port=3389"
 
-      - name: Tailscale (optional)
+      - name: Optional - Tailscale
         if: ${{ inputs.ts_authkey != '' }}
         shell: bash
         run: |
           set -e
           curl -fsSL https://tailscale.com/install.sh | sh
-          sudo tailscale up --authkey "${{ inputs.ts_authkey }}" --hostname "ubuntu-rdp" --accept-dns=true --accept-routes=true
+          sudo tailscale up --authkey "${{ inputs.ts_authkey }}" --hostname "ubuntu-rdp-jammy" --accept-dns=true --accept-routes=true
           tailscale ip -4 | head -n1 || true
 
-      - name: Ngrok TCP 3389 (optional)
+      - name: Optional - Ngrok TCP 3389
         if: ${{ inputs.ngrok != '' }}
         shell: bash
         run: |
           set -e
           RAW="${{ inputs.ngrok }}"
-          TOK=$(echo "$RAW" | cut -d',' -f1)
+          TOK=$(echo "$RAW" | cut -d',' -f1 | awk '{print $1}')
           REG=$(echo "$RAW" | cut -d',' -f2)
           [ -z "$REG" ] && REG="in"
-          curl -sSL -o ng.zip https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-stable-linux-amd64.zip
-          unzip -o ng.zip
+          curl -sSL -o ngrok.zip https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-stable-linux-amd64.zip
+          unzip -o ngrok.zip
           ./ngrok authtoken "$TOK"
           nohup ./ngrok tcp 3389 --region "$REG" >/tmp/ngrok.log 2>&1 &
           sleep 8
+          echo "Ngrok TCP URL(s):"
           curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[]?.public_url' || true
 
-      - name: Chrome Remote Desktop (optional)
+      - name: Optional - Chrome Remote Desktop
         if: ${{ inputs.crd_code != '' }}
         shell: bash
         run: |
@@ -130,15 +92,17 @@ jobs:
           CODE_RAW="${{ inputs.crd_code }}"
           PIN="${{ inputs.crd_pin }}"
           echo "$PIN" | grep -Eq '^[0-9]{6,12}$' || { echo "Invalid CRD PIN"; exit 1; }
-          CODE=$(echo "$CODE_RAW" | sed -n 's/.*--code="\{0,1\}\(4\/[^" ]*\).*/\1/p' | head -n1)
+          # Extract a 4/... token if full command/URL was pasted
+          CODE=$(echo "$CODE_RAW" | grep -o '4/[^" ]*' | head -n1)
           [ -z "$CODE" ] && { echo "No CRD code detected"; exit 1; }
           sudo -u "$USERNAME" /opt/google/chrome-remote-desktop/start-host \
             --code="$CODE" \
             --redirect-url="https://remotedesktop.google.com/_/oauthredirect" \
-            --name="ubuntu-rdp" \
+            --name="ubuntu-rdp-jammy" \
             --pin="$PIN"
           sudo systemctl enable chrome-remote-desktop@$USERNAME
           sudo systemctl restart chrome-remote-desktop@$USERNAME
+          echo "CRD started."
 
       - name: Keep alive ~6 hours
         shell: bash
