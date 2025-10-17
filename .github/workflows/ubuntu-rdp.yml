@@ -1,21 +1,37 @@
-name: Ubuntu GNOME Flashback + VNC + Tailscale (Stable)
+name: GNOME + Tailscale + VNC & xRDP (No Secrets)
 
 on:
   workflow_dispatch:
     inputs:
-      tailscale_authkey:
-        description: "Tailscale Auth Key (ephemeral or reusable)"
+      ts_authkey:
+        description: "Tailscale Auth key (paste here; not using GitHub Secrets)"
         required: true
       username:
-        description: "Login username"
+        description: "Linux username for desktop login"
         required: false
         default: "runner"
       password:
-        description: "Login password"
+        description: "Password for the user, VNC & xRDP"
         required: false
         default: "runner"
+      enable_vnc:
+        description: "Enable TigerVNC server"
+        type: boolean
+        default: true
+      enable_xrdp:
+        description: "Enable xRDP server"
+        type: boolean
+        default: true
+      vnc_display:
+        description: "VNC display number (e.g., 1 -> port 5901)"
+        required: false
+        default: "1"
+      vnc_geometry:
+        description: "VNC screen size (e.g., 1366x768 or 1280x720)"
+        required: false
+        default: "1366x768"
       runtime_minutes:
-        description: "Minutes to keep alive (max 360)"
+        description: "Workflow runtime in minutes (max 355)"
         required: false
         default: "355"
 
@@ -23,93 +39,129 @@ permissions:
   contents: read
 
 jobs:
-  gnome-vnc:
+  gui-runner:
     runs-on: ubuntu-latest
-    timeout-minutes: 370
+
     env:
-      USERNAME: ${{ github.event.inputs.username || 'runner' }}
-      PASSWORD: ${{ github.event.inputs.password || 'runner' }}
-      TS_AUTHKEY: ${{ github.event.inputs.tailscale_authkey }}
-      TS_HOSTNAME: gh-gnome-flashback-${{ github.run_id }}
-      RUNTIME_MINUTES: ${{ github.event.inputs.runtime_minutes || '355' }}
+      USERNAME: ${{ inputs.username }}
+      PASSWORD: ${{ inputs.password }}
+      TS_AUTHKEY: ${{ inputs.ts_authkey }}
+      VNC_DISPLAY: ${{ inputs.vnc_display }}
+      VNC_GEOMETRY: ${{ inputs.vnc_geometry }}
+      ENABLE_VNC: ${{ inputs.enable_vnc }}
+      ENABLE_XRDP: ${{ inputs.enable_xrdp }}
+      RUNTIME_MINUTES: ${{ inputs.runtime_minutes }}
+      HOSTNAME: gh-gnome-${{ github.run_id }}
 
     steps:
-      - name: Setup user and sudo
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Normalize/validate inputs
+        id: cfg
+        shell: bash
         run: |
+          runtime="${RUNTIME_MINUTES:-355}"
+          if ! [[ "$runtime" =~ ^[0-9]+$ ]]; then runtime=355; fi
+          if [ "$runtime" -gt 355 ]; then runtime=355; fi
+          echo "runtime=$runtime" >> "$GITHUB_OUTPUT"
+          nvnc="${ENABLE_VNC}"; [ "$nvnc" = "true" ] || [ "$nvnc" = "True" ] || [ "$nvnc" = "1" ] || nvnc="false"
+          nxrdp="${ENABLE_XRDP}"; [ "$nxrdp" = "true" ] || [ "$nxrdp" = "True" ] || [ "$nxrdp" = "1" ] || nxrdp="false"
+          echo "enable_vnc=$nvnc" >> "$GITHUB_OUTPUT"
+          echo "enable_xrdp=$nxrdp" >> "$GITHUB_OUTPUT"
+          disp="${VNC_DISPLAY:-1}"
+          if ! [[ "$disp" =~ ^[0-9]+$ ]]; then disp=1; fi
+          [ "$disp" -lt 1 ] && disp=1
+          [ "$disp" -gt 9 ] && disp=9
+          echo "vnc_display=$disp" >> "$GITHUB_OUTPUT"
+          geom="${VNC_GEOMETRY:-1366x768}"
+          if ! [[ "$geom" =~ ^[0-9]+x[0-9]+$ ]]; then geom="1366x768"; fi
+          echo "vnc_geometry=$geom" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare user and basic packages
+        shell: bash
+        run: |
+          set -euxo pipefail
           echo "${USERNAME}:${PASSWORD}" | sudo chpasswd
-          echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/${USERNAME}
+          echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/${USERNAME} >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              xorg dbus-x11 gnome-session gnome-terminal gsettings-desktop-schemas \
+              policykit-1 x11-xserver-utils fonts-dejavu-core
+          sudo apt-get install -y curl jq net-tools psmisc lsof
 
-      - name: Install GNOME Flashback and VNC
+      - name: Install & configure xRDP (GNOME)
+        if: ${{ steps.cfg.outputs.enable_xrdp == 'true' }}
+        shell: bash
         run: |
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            gnome-session-flashback gnome-panel metacity nautilus gnome-terminal \
-            dbus-x11 tigervnc-standalone-server tigervnc-common tigervnc-tools \
-            x11-xserver-utils mesa-utils policykit-1
+          set -euxo pipefail
+          sudo apt-get install -y xrdp xorgxrdp
+          sudo adduser ${USERNAME} ssl-cert || true
+          su - "${USERNAME}" -c 'echo "gnome-session --session=ubuntu" > ~/.xsession'
+          sudo sed -i 's/^test -r/#&/' /etc/xrdp/startwm.sh
+          sudo bash -lc 'cat >> /etc/xrdp/startwm.sh <<EOF
+unset DBUS_SESSION_BUS_ADDRESS
+unset XDG_RUNTIME_DIR
+gnome-session --session=ubuntu &
+wait
+EOF'
+          sudo systemctl enable xrdp || true
+          sudo systemctl restart xrdp || true
 
-          # Disable Wayland (force Xorg)
-          sudo sed -i 's/^#\?WaylandEnable=.*/WaylandEnable=false/' /etc/gdm3/custom.conf || true
-
-          # Force software rendering
-          echo "export LIBGL_ALWAYS_SOFTWARE=1" | sudo tee -a /etc/environment
-          echo "export GDK_BACKEND=x11" | sudo tee -a /etc/environment
-
-          # Create Xauthority before start
-          sudo -u ${USERNAME} touch /home/${USERNAME}/.Xauthority
-          sudo chown ${USERNAME}:${USERNAME} /home/${USERNAME}/.Xauthority
-
-          # Set VNC password
-          sudo -u ${USERNAME} mkdir -p /home/${USERNAME}/.vnc
-          echo "${PASSWORD}" | vncpasswd -f | sudo tee /home/${USERNAME}/.vnc/passwd >/dev/null
-          sudo chmod 600 /home/${USERNAME}/.vnc/passwd
-          sudo chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}/.vnc
-
-          # Create working xstartup file
-          cat <<'EOF' | sudo tee /home/${USERNAME}/.vnc/xstartup >/dev/null
-          #!/bin/sh
-          unset SESSION_MANAGER
-          unset DBUS_SESSION_BUS_ADDRESS
-          export XDG_SESSION_TYPE=x11
-          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
-          mkdir -p "$XDG_RUNTIME_DIR"; chmod 700 "$XDG_RUNTIME_DIR" || true
-          export XAUTHORITY="$HOME/.Xauthority"
-          export LIBGL_ALWAYS_SOFTWARE=1
-          export GDK_BACKEND=x11
-          xrdb $HOME/.Xresources
-          xsetroot -solid grey
-          dbus-launch --exit-with-session gnome-session --session=gnome-flashback-metacity &
-          EOF
-          sudo chmod +x /home/${USERNAME}/.vnc/xstartup
-          sudo chown ${USERNAME}:${USERNAME} /home/${USERNAME}/.vnc/xstartup
-
-      - name: Install Tailscale
+      - name: Install & configure TigerVNC (GNOME)
+        if: ${{ steps.cfg.outputs.enable_vnc == 'true' }}
+        shell: bash
         run: |
-          curl -fsSL https://tailscale.com/install.sh | sudo sh
-          sudo tailscale up --authkey "${TS_AUTHKEY}" --hostname "${TS_HOSTNAME}"
-          sudo tailscale ip -4
+          set -euxo pipefail
+          sudo apt-get install -y tigervnc-standalone-server
+          su - "${USERNAME}" -c 'mkdir -p ~/.vnc'
+          su - "${USERNAME}" -c "printf '%s\n%s\n\n' '${PASSWORD}' '${PASSWORD}' | vncpasswd"
+          su - "${USERNAME}" -c "chmod 600 ~/.vnc/passwd"
+          su - "${USERNAME}" -c 'cat > ~/.vnc/xstartup <<EOF
+#!/bin/sh
+unset SESSION_MANAGER
+unset DBUS_SESSION_BUS_ADDRESS
+exec gnome-session --session=ubuntu &
+EOF
+chmod +x ~/.vnc/xstartup'
+          su - "${USERNAME}" -c "vncserver -kill :${{ steps.cfg.outputs.vnc_display }} || true"
+          su - "${USERNAME}" -c "vncserver :${{ steps.cfg.outputs.vnc_display }} -geometry ${{ steps.cfg.outputs.vnc_geometry }} -localhost no"
 
-      - name: Start TigerVNC Server
+      - name: Install & bring up Tailscale
+        shell: bash
         run: |
-          sudo -u ${USERNAME} vncserver -kill :1 >/dev/null 2>&1 || true
-          sudo -u ${USERNAME} vncserver :1 -geometry 1280x800 -depth 24 -localhost no
-          echo "VNC started successfully."
-          tail -n 30 /home/${USERNAME}/.vnc/*.log || true
+          set -euxo pipefail
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo nohup /usr/sbin/tailscaled --state=mem: --socket=/run/tailscaled.sock >/tmp/tailscaled.log 2>&1 &
+          sudo -E tailscale up --reset --authkey="${TS_AUTHKEY}" --hostname="${HOSTNAME}" --ssh
+          tailscale ip || true
 
-      - name: Connection Info
+      - name: Show connection info
+        shell: bash
         run: |
-          TS4=$(tailscale ip -4 | head -n1)
-          echo "----------------------------------------------------"
-          echo "User      : ${USERNAME} / ${PASSWORD}"
-          echo "VNC       : Enabled (display :1, port 5901)"
-          echo "Password  : ${PASSWORD}"
-          echo "Tailscale : ${TS4}:5901"
-          echo "Connect   : With any VNC viewer to the above IP"
-          echo "----------------------------------------------------"
+          ts_ip4="$(tailscale ip -4 | head -n1 || true)"
+          ts_ip6="$(tailscale ip -6 | head -n1 || true)"
+          vnc_port=$((5900 + ${{ steps.cfg.outputs.vnc_display }}))
+          echo "Tailscale IPv4: ${ts_ip4}"
+          echo "Tailscale IPv6: ${ts_ip6}"
+          if [ "${{ steps.cfg.outputs.enable_xrdp }}" = "true" ]; then
+            echo "xRDP: ${ts_ip4}:3389 (user=${USERNAME})"
+          fi
+          if [ "${{ steps.cfg.outputs.enable_vnc }}" = "true" ]; then
+            echo "VNC: ${ts_ip4}:${vnc_port} (password=${PASSWORD})"
+          fi
 
-      - name: Keep Alive (~6h)
+      - name: Keep alive for runtime
+        shell: bash
         run: |
-          END=$(( $(date +%s) + 60*${RUNTIME_MINUTES:-355} ))
-          while [ "$(date +%s)" -lt "$END" ]; do
-            echo "[ $(date +%T) ] alive • VNC"
+          mins=${{ steps.cfg.outputs.runtime }}
+          for i in $(seq 1 $mins); do
+            echo "minute $i / $mins - $(date -u +%F_%T)"
             sleep 60
           done
+
+      - name: Cleanup (stop VNC)
+        if: ${{ always() && steps.cfg.outputs.enable_vnc == 'true' }}
+        shell: bash
+        run: |
+          su - "${USERNAME}" -c "vncserver -kill :${{ steps.cfg.outputs.vnc_display }} || true"
