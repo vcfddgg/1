@@ -1,144 +1,66 @@
-name: Ubuntu Desktop via Chrome Remote Desktop (XFCE + Python)
+name: Setup XFCE Runner + Tailscale + VNC
 
 on:
   workflow_dispatch:
-    inputs:
-      crd_code:
-        description: "Paste the CRD code (starts with 4/...) OR the full command that contains --code=\"4/...\""
-        required: true
-        default: ""
-      crd_pin:
-        description: "CRD PIN (6–12 digits)"
-        required: true
-        default: "123456"
-      runtime_minutes:
-        description: "How long to keep the session alive (max 360; default 355)"
-        required: false
-        default: "355"
+
+permissions:
+  contents: read
 
 jobs:
-  ubuntu_crd:
-    runs-on: ubuntu-22.04   # jammy is stable for desktop on GitHub runners
-    timeout-minutes: 370
+  setup-gui-runner:
+    runs-on: ubuntu-latest
     env:
-      USERNAME: Bullettemporary
-      PASSWORD: Bullet@12345
-      RUNTIME_MINUTES: ${{ inputs.runtime_minutes }}
+      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+      USERNAME: runner
+      PASSWORD: runner
+      TAILSCALE_HOSTNAME: gh-xfce-vnc-${{ github.run_id }}
 
     steps:
-      - name: Install XFCE desktop & basics
-        shell: bash
+      - uses: actions/checkout@v4
+
+      - name: Ensure runner user has sudo
         run: |
-          set -e
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            xfce4 xfce4-goodies xorg dbus-x11 dbus-user-session x11-xserver-utils \
-            curl wget unzip jq policykit-1 gvfs locales
-          sudo locale-gen en_US.UTF-8
-          echo 'LANG=en_US.UTF-8' | sudo tee /etc/default/locale >/dev/null
+          echo "${USERNAME}:${PASSWORD}" | sudo chpasswd
+          echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/${USERNAME}
 
-          # Create desktop user
-          if ! id -u "$USERNAME" >/dev/null 2>&1; then
-            sudo useradd -m -s /bin/bash "$USERNAME"
-          fi
-          echo "$USERNAME:$PASSWORD" | sudo chpasswd
-          echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/$USERNAME >/dev/null
-
-          # Default session for CRD
-          sudo -u "$USERNAME" bash -lc 'printf "%s\n" "exec /usr/bin/xfce4-session" > ~/.chrome-remote-desktop-session'
-
-      - name: Install Chrome Remote Desktop host
-        shell: bash
+      - name: Install XFCE + VNC server
         run: |
-          set -e
-          # Install CRD host .deb
-          curl -fsSL -o /tmp/chrome-remote-desktop.deb \
-            https://dl.google.com/linux/direct/chrome-remote-desktop_current_amd64.deb
-          sudo dpkg -i /tmp/chrome-remote-desktop.deb || sudo apt-get -f install -y
+          echo ">>> Installing XFCE Desktop + VNC..."
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            xfce4 xfce4-terminal dbus-x11 xorg \
+            tigervnc-standalone-server tigervnc-common tigervnc-tools
 
-          # Put user into CRD group
-          sudo usermod -aG chrome-remote-desktop "$USERNAME"
+          # Configure VNC password for the runner
+          mkdir -p /home/${USERNAME}/.vnc
+          echo ${PASSWORD} | vncpasswd -f > /home/${USERNAME}/.vnc/passwd
+          chmod 600 /home/${USERNAME}/.vnc/passwd
+          chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}/.vnc
 
-      - name: Register CRD (use your code + PIN)
-        shell: bash
+          # Start XFCE when VNC launches
+          echo "startxfce4" > /home/${USERNAME}/.xsession
+          chown ${USERNAME}:${USERNAME} /home/${USERNAME}/.xsession
+
+      - name: Install Tailscale
         run: |
-          set -e
-          RAW="${{ inputs.crd_code }}"
-          PIN="${{ inputs.crd_pin }}"
+          echo ">>> Installing Tailscale..."
+          curl -fsSL https://tailscale.com/install.sh | sudo sh
+          sudo tailscale up --authkey "${TAILSCALE_AUTHKEY}" --hostname "${TAILSCALE_HOSTNAME}"
 
-          # Basic validation
-          if ! echo "$PIN" | grep -Eq '^[0-9]{6,12}$'; then
-            echo "crd_pin must be 6–12 digits." >&2
-            exit 1
-          fi
-
-          # Extract code: accept either raw 4/... or full command containing --code="4/..."
-          CODE=""
-          if echo "$RAW" | grep -q -- '--code='; then
-            CODE="$(printf "%s" "$RAW" | sed -n 's/.*--code[= ]\"*\([^\"[:space:]]\+\)\"*.*/\1/p' | head -n1)"
-          elif echo "$RAW" | grep -q '^4/'; then
-            CODE="$RAW"
-          fi
-
-          if [ -z "$CODE" ]; then
-            echo "Could not detect CRD code. Paste raw 4/... or a full command containing --code=\"4/...\"" >&2
-            exit 1
-          fi
-
-          REDIR="https://remotedesktop.google.com/_/oauthredirect"
-          NAME="ubuntu-crd-${GITHUB_RUN_ID}"
-
-          # Start host for our user
-          sudo -u "$USERNAME" /opt/google/chrome-remote-desktop/start-host \
-            --code="$CODE" --redirect-url="$REDIR" --name="$NAME" --pin="$PIN"
-
-          # Enable and start the per-user service
-          sudo systemctl enable "chrome-remote-desktop@$USERNAME"
-          sudo systemctl restart "chrome-remote-desktop@$USERNAME"
-
-          echo "CRD registered. It should appear in your Chrome Remote Desktop list shortly."
-
-      - name: Install Python 3 + pip (useful tools)
-        shell: bash
+      - name: Start VNC + Show Tailscale Info
         run: |
-          set -e
-          sudo apt-get update
-          sudo apt-get install -y python3 python3-pip python3-venv python3-dev build-essential
-          python3 -m pip install --upgrade pip wheel setuptools
-          python3 --version && pip3 --version
+          echo ">>> Starting VNC server..."
+          # Run VNC on all interfaces (not only localhost)
+          sudo -u ${USERNAME} vncserver :1 -geometry 1280x800 -depth 24 -localhost no
 
-      - name: Info & credentials
-        shell: bash
-        run: |
-          echo "---------------------------------------------"
-          echo "Login user: $USERNAME"
-          echo "Password  : $PASSWORD"
-          echo "CRD PIN   : (the one you entered: ${{ inputs.crd_pin }})"
-          echo "Session   : XFCE"
-          echo "---------------------------------------------"
-          echo "Open https://remotedesktop.google.com/access to connect."
-          echo "The machine name: ubuntu-crd-${GITHUB_RUN_ID}"
-          echo "---------------------------------------------"
+          # Get Tailscale IP
+          TAILSCALE_IP=$(tailscale ip -4 | head -n1)
 
-      - name: Keep alive (~6 hours)
-        shell: bash
-        run: |
-          # sanitize runtime
-          R="${RUNTIME_MINUTES:-355}"
-          if ! echo "$R" | grep -Eq '^[0-9]+$'; then R=355; fi
-          if [ "$R" -lt 5 ] || [ "$R" -gt 360 ]; then R=355; fi
-
-          END=$(( $(date +%s) + 60 * R ))
-          echo "Keeping runner alive for $R minutes (until $(date -d @${END} +%T))."
-          while [ $(date +%s) -lt $END ]; do
-            systemctl is-active "chrome-remote-desktop@$USERNAME" >/dev/null 2>&1 && STATUS="CRD:active" || STATUS="CRD:starting"
-            echo "[$(date +%T)] ${STATUS} • alive"
-            sleep 60
-          done
-
-      - name: Logs on failure
-        if: failure()
-        shell: bash
-        run: |
-          echo "--- CRD journal ---"
-          sudo journalctl -u "chrome-remote-desktop@$USERNAME" --since "1 hour ago" -n 200 || true
+          echo "=== CONNECTION INFO ==="
+          echo "USERNAME: ${USERNAME}"
+          echo "PASSWORD: ${PASSWORD}"
+          echo "Connect with any VNC client to:"
+          echo "    ${TAILSCALE_IP}:5901"
+          echo
+          echo ">>> Keeping runner alive..."
+          tail -f /dev/null
