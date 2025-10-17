@@ -1,4 +1,4 @@
-name: Xfce + Tailscale + VNC (Fast & Stable v8)
+name: Xfce + Tailscale + VNC (Fast v9, YAML-safe)
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ on:
         required: false
         default: "runner"
       password:
-        description: "Password for the user, VNC access"
+        description: "Password for the user and VNC"
         required: false
         default: "runner"
       runtime_minutes:
@@ -35,44 +35,54 @@ jobs:
       HOSTNAME: xfce-${{ github.run_id }}
 
     steps:
-      - name: Checkout
+      - name: "Checkout"
         uses: actions/checkout@v4
 
-      - name: Install minimal desktop + VNC + tools
+      - name: "Install minimal desktop, VNC, tools"
+        shell: bash
         run: |
           set -eux
           echo "${USERNAME}:${PASSWORD}" | sudo chpasswd
-          echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/${USERNAME}
+          echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/${USERNAME} >/dev/null
           sudo apt-get update
-          # minimal xfce session (headless)
-          sudo apt-get install -y xfce4-session xfce4-panel xfce4-terminal xfdesktop4 xorg dbus-x11 tigervnc-standalone-server xvfb curl jq net-tools
+          # Lightweight Xfce stack + Xorg + VNC + Xvfb
+          sudo apt-get install -y \
+            xfce4-session xfce4-panel xfce4-terminal xfdesktop4 \
+            xorg dbus-x11 tigervnc-standalone-server xvfb \
+            curl jq net-tools x11-xserver-utils
 
-      - name: Start Xvfb and prepare display
+      - name: "Start Xvfb display :99"
+        shell: bash
         run: |
           set -eux
           sudo Xvfb :99 -screen 0 1366x768x24 >/tmp/xvfb.log 2>&1 &
-          echo "DISPLAY=:99" | sudo tee -a /etc/environment
+          echo "DISPLAY=:99" | sudo tee -a /etc/environment >/dev/null
           export DISPLAY=:99
           sleep 2
 
-      - name: Configure and start VNC
+      - name: "Configure and start VNC"
+        shell: bash
         run: |
           set -eux
-          mkdir -p /home/${USERNAME}/.vnc
-          printf '%s\n%s\n\n' "${PASSWORD}" "${PASSWORD}" | sudo -u ${USERNAME} vncpasswd
-          sudo -u ${USERNAME} bash -lc 'cat > ~/.vnc/xstartup <<EOF
-#!/bin/sh
-unset SESSION_MANAGER
-unset DBUS_SESSION_BUS_ADDRESS
-export DISPLAY=:99
-xfce4-session &
-EOF'
-          sudo -u ${USERNAME} chmod +x /home/${USERNAME}/.vnc/xstartup
-          sudo -u ${USERNAME} vncserver -kill :1 || true
-          sudo -u ${USERNAME} vncserver :1 -geometry 1366x768 -localhost no
-          echo "✅ VNC started on port 5901 (display :1)"
+          # VNC password store
+          sudo -u "${USERNAME}" mkdir -p "/home/${USERNAME}/.vnc"
+          sudo -u "${USERNAME}" bash -lc "printf '%s\n%s\n\n' '${PASSWORD}' '${PASSWORD}' | vncpasswd"
+          sudo -u "${USERNAME}" chmod 600 "/home/${USERNAME}/.vnc/passwd"
 
-      - name: Install and start Tailscale
+          # xstartup script (no heredocs)
+          sudo -u "${USERNAME}" bash -lc 'printf "%s\n" "#!/bin/sh" > ~/.vnc/xstartup'
+          sudo -u "${USERNAME}" bash -lc 'printf "%s\n" "unset SESSION_MANAGER" >> ~/.vnc/xstartup'
+          sudo -u "${USERNAME}" bash -lc 'printf "%s\n" "unset DBUS_SESSION_BUS_ADDRESS" >> ~/.vnc/xstartup'
+          sudo -u "${USERNAME}" bash -lc 'printf "%s\n" "export DISPLAY=:99" >> ~/.vnc/xstartup'
+          sudo -u "${USERNAME}" bash -lc 'printf "%s\n" "xfce4-session &" >> ~/.vnc/xstartup'
+          sudo -u "${USERNAME}" chmod +x "/home/${USERNAME}/.vnc/xstartup"
+
+          # Start VNC on :1 (port 5901)
+          sudo -u "${USERNAME}" vncserver -kill :1 || true
+          sudo -u "${USERNAME}" vncserver :1 -geometry 1366x768 -localhost no
+
+      - name: "Install and start Tailscale"
+        shell: bash
         run: |
           set -eux
           curl -fsSL https://tailscale.com/install.sh | sh
@@ -80,26 +90,29 @@ EOF'
           sudo -E tailscale up --reset --authkey="${TS_AUTHKEY}" --hostname="${HOSTNAME}" --ssh
           tailscale ip || true
 
-      - name: Connection Info
+      - name: "Connection info"
+        shell: bash
         run: |
-          ts_ip=$(tailscale ip -4 | head -n1 || echo "N/A")
+          ts_ip4="$(tailscale ip -4 | head -n1 || echo N/A)"
           echo "===== CONNECTION INFO ====="
-          echo "Tailscale IPv4: ${ts_ip}"
-          echo "Username: ${USERNAME}"
-          echo "Password: ${PASSWORD}"
-          echo "VNC port: 5901"
-          echo "============================"
+          echo "Tailscale IPv4: ${ts_ip4}"
+          echo "User: ${USERNAME}"
+          echo "Password: (your workflow password)"
+          echo "VNC: ${ts_ip4}:5901 (display :1)"
+          echo "==========================="
 
-      - name: Keep alive
+      - name: "Keep alive"
+        shell: bash
         run: |
-          mins=${RUNTIME_MINUTES:-355}
-          echo "Keeping alive for $mins minutes..."
-          for i in $(seq 1 $mins); do
-            echo "Minute $i / $mins - $(date -u +%F_%T)"
+          mins="${RUNTIME_MINUTES:-355}"
+          echo "Keeping alive for ${mins} minutes..."
+          for i in $(seq 1 "${mins}"); do
+            echo "Minute $i / ${mins} - $(date -u +%F_%T)"
             sleep 60
           done
 
-      - name: Cleanup
+      - name: "Cleanup"
         if: always()
+        shell: bash
         run: |
-          sudo -u ${USERNAME} vncserver -kill :1 || true
+          sudo -u "${USERNAME}" vncserver -kill :1 || true
