@@ -1,4 +1,4 @@
-name: GNOME + Tailscale + VNC and xRDP (No Secrets, Clean v3)
+name: GNOME + Tailscale + VNC and xRDP (No Secrets, Clean v4)
 
 on:
   workflow_dispatch:
@@ -62,7 +62,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           runtime="${RUNTIME_MINUTES_IN:-355}"
           if ! [[ "$runtime" =~ ^[0-9]+$ ]]; then runtime=355; fi
           if [ "$runtime" -gt 355 ]; then runtime=355; fi
@@ -105,13 +104,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y xrdp xorgxrdp
           sudo adduser "${USER_LOGIN}" ssl-cert || true
-          sudo -u "${USER_LOGIN}" bash -lc 'echo "gnome-session --session=ubuntu" > ~/.xsession'
-          # Avoid black screen by bypassing default startwm.sh guards and starting GNOME
+
+          # Default GNOME session for RDP logins
+          sudo -u "${USER_LOGIN}" bash -lc 'printf "%s\n" "gnome-session --session=ubuntu" > ~/.xsession'
+
+          # Avoid black screen; ensure GNOME starts
           sudo sed -i 's/^test -r/#&/' /etc/xrdp/startwm.sh
-          echo "unset DBUS_SESSION_BUS_ADDRESS"        | sudo tee -a /etc/xrdp/startwm.sh >/dev/null
-          echo "unset XDG_RUNTIME_DIR"                 | sudo tee -a /etc/xrdp/startwm.sh >/dev/null
-          echo "gnome-session --session=ubuntu &"      | sudo tee -a /etc/xrdp/startwm.sh >/dev/null
-          echo "wait"                                  | sudo tee -a /etc/xrdp/startwm.sh >/dev/null
+          printf "%s\n" "unset DBUS_SESSION_BUS_ADDRESS" | sudo tee -a /etc/xrdp/startwm.sh >/dev/null
+          printf "%s\n" "unset XDG_RUNTIME_DIR"        | sudo tee -a /etc/xrdp/startwm.sh >/dev/null
+          printf "%s\n" "gnome-session --session=ubuntu &" | sudo tee -a /etc/xrdp/startwm.sh >/dev/null
+          printf "%s\n" "wait"                          | sudo tee -a /etc/xrdp/startwm.sh >/dev/null
+
           sudo systemctl enable xrdp || true
           sudo systemctl restart xrdp || true
 
@@ -128,18 +131,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y tigervnc-standalone-server
           sudo -u "${USER_LOGIN}" mkdir -p "/home/${USER_LOGIN}/.vnc"
+
           # Set VNC password
           sudo -u "${USER_LOGIN}" bash -lc "printf '%s\n%s\n\n' '${VNC_PASS}' '${VNC_PASS}' | vncpasswd"
           sudo -u "${USER_LOGIN}" chmod 600 "/home/${USER_LOGIN}/.vnc/passwd"
-          # GNOME xstartup
-          sudo -u "${USER_LOGIN}" bash -lc 'cat > ~/.vnc/xstartup <<EOF
-#!/bin/sh
-unset SESSION_MANAGER
-unset DBUS_SESSION_BUS_ADDRESS
-exec gnome-session --session=ubuntu &
-EOF
-chmod +x ~/.vnc/xstartup'
-          # Restart VNC server on the chosen display
+
+          # Write xstartup for GNOME (no heredoc)
+          sudo -u "${USER_LOGIN}" bash -lc 'printf "%s\n" "#!/bin/sh" > ~/.vnc/xstartup'
+          sudo -u "${USER_LOGIN}" bash -lc 'printf "%s\n" "unset SESSION_MANAGER" >> ~/.vnc/xstartup'
+          sudo -u "${USER_LOGIN}" bash -lc 'printf "%s\n" "unset DBUS_SESSION_BUS_ADDRESS" >> ~/.vnc/xstartup'
+          sudo -u "${USER_LOGIN}" bash -lc 'printf "%s\n" "exec gnome-session --session=ubuntu &" >> ~/.vnc/xstartup'
+          sudo -u "${USER_LOGIN}" chmod +x "/home/${USER_LOGIN}/.vnc/xstartup"
+
+          # Restart VNC server on chosen display
           sudo -u "${USER_LOGIN}" vncserver -kill ":${VNC_DISP}" || true
           sudo -u "${USER_LOGIN}" vncserver ":${VNC_DISP}" -geometry "${VNC_GEOM}" -localhost no
 
