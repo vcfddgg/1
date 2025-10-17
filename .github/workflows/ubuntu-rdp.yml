@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       vnc_password:
-        description: "VNC password (6-8 chars; default vnc12345)"
+        description: "VNC password (6–8 chars; default vnc12345)"
         required: false
         default: "vnc12345"
       expose_with_cloudflared:
@@ -37,56 +37,62 @@ jobs:
           sudo locale-gen en_US.UTF-8
           echo 'LANG=en_US.UTF-8' | sudo tee /etc/default/locale >/dev/null
 
+          # User
           if ! id -u "$USERNAME" >/dev/null 2>&1; then
             sudo useradd -m -s /bin/bash "$USERNAME"
           fi
           echo "$USERNAME:$PASSWORD" | sudo chpasswd
           echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/$USERNAME >/dev/null
 
+          # Runtime dir for user bus
           U=$(id -u "$USERNAME")
           sudo install -d -m 700 -o "$USERNAME" -g "$USERNAME" "/run/user/$U"
 
-          sudo -u "$USERNAME" mkdir -p /home/$USERNAME/.vnc
-          sudo bash -c 'cat > /home/'"$USERNAME"'/.vnc/xstartup <<EOF
-#!/bin/sh
-unset SESSION_MANAGER
-unset DBUS_SESSION_BUS_ADDRESS
-export LANG=en_US.UTF-8
-export LC_ALL=en_US.UTF-8
-export XDG_CONFIG_DIRS=/etc/xdg:/etc
-export DESKTOP_SESSION=xfce
-export XDG_CURRENT_DESKTOP=XFCE
-exec dbus-run-session -- startxfce4
-EOF'
-          sudo chmod +x /home/$USERNAME/.vnc/xstartup
-          sudo chown -R "$USERNAME:$USERNAME" /home/$USERNAME/.vnc
+          # xstartup without heredoc (YAML-safe)
+          sudo -u "$USERNAME" mkdir -p "/home/$USERNAME/.vnc"
+          sudo bash -c 'printf "%s\n" \
+            "#!/bin/sh" \
+            "unset SESSION_MANAGER" \
+            "unset DBUS_SESSION_BUS_ADDRESS" \
+            "export LANG=en_US.UTF-8" \
+            "export LC_ALL=en_US.UTF-8" \
+            "export XDG_CONFIG_DIRS=/etc/xdg:/etc" \
+            "export DESKTOP_SESSION=xfce" \
+            "export XDG_CURRENT_DESKTOP=XFCE" \
+            "exec dbus-run-session -- startxfce4" \
+            > /home/'"$USERNAME"'/.vnc/xstartup'
+          sudo chmod +x "/home/$USERNAME/.vnc/xstartup"
+          sudo chown -R "$USERNAME:$USERNAME" "/home/$USERNAME/.vnc"
 
+          # VNC password (TigerVNC uses first 8 chars)
           VPASS="${{ inputs.vnc_password }}"
           [ -z "$VPASS" ] && VPASS="vnc12345"
           echo "$VPASS" | head -c 8 | sudo -u "$USERNAME" bash -c "vncpasswd -f > /home/$USERNAME/.vnc/passwd"
-          sudo chmod 600 /home/$USERNAME/.vnc/passwd
+          sudo chmod 600 "/home/$USERNAME/.vnc/passwd"
 
+          # Start VNC + noVNC
           sudo -u "$USERNAME" vncserver "$VNC_DISPLAY" -geometry "$VNC_GEOMETRY" -depth "$VNC_DEPTH"
           nohup websockify --web=/usr/share/novnc 6080 localhost:5901 >/tmp/novnc.log 2>&1 &
-          echo "✅ VNC running on 5901 | noVNC → http://127.0.0.1:6080/"
+          echo "✅ VNC on 5901 | noVNC → http://127.0.0.1:6080/"
 
       - name: Optional – Expose noVNC via Cloudflare (no account needed)
         if: ${{ inputs.expose_with_cloudflared == 'true' }}
         shell: bash
         run: |
           set -e
-          # Download correct binary (no .tgz on some mirrors)
           curl -L -o /tmp/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x /tmp/cloudflared
           nohup /tmp/cloudflared tunnel --url http://localhost:6080 >/tmp/cloudflared.log 2>&1 &
           for i in {1..30}; do
             URL=$(grep -Eo 'https://[-a-z0-9.]+trycloudflare.com' /tmp/cloudflared.log | tail -n1 || true)
-            [ -n "$URL" ] && echo "PUBLIC_NOVNC_URL=$URL" | tee -a $GITHUB_ENV && echo "🌐 $URL" && break
+            if [ -n "$URL" ]; then
+              echo "PUBLIC_NOVNC_URL=$URL" | tee -a "$GITHUB_ENV"
+              echo "🌐 Public noVNC: $URL"
+              break
+            fi
             sleep 2
           done
-          if [ -z "$URL" ]; then
-            echo "⚠️  No Cloudflare URL found. Check /tmp/cloudflared.log"
-          fi
+          [ -n "$URL" ] || echo "⚠️  Cloudflare URL not found. See /tmp/cloudflared.log"
 
       - name: Install Python 3 + pip
         shell: bash
@@ -100,7 +106,7 @@ EOF'
         run: |
           echo "---------------------------------------------"
           echo "User: $USERNAME / Pass: $PASSWORD"
-          echo "VNC password: '${{ inputs.vnc_password }}'"
+          echo "VNC password (first 8 chars used): '${{ inputs.vnc_password }}'"
           echo "Local noVNC:  http://127.0.0.1:6080/"
           if [ -n "${PUBLIC_NOVNC_URL:-}" ]; then
             echo "Public noVNC: ${PUBLIC_NOVNC_URL}"
