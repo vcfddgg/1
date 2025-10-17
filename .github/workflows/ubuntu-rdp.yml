@@ -1,124 +1,138 @@
-name: Ubuntu VNC Desktop (Jammy – XFCE + noVNC + Cloudflare + Python)
+name: Ubuntu Desktop via Chrome Remote Desktop (XFCE + Python)
 
 on:
   workflow_dispatch:
     inputs:
-      vnc_password:
-        description: "VNC password (6–8 chars; default vnc12345)"
+      crd_code:
+        description: "Paste the CRD code (starts with 4/...) OR the full command that contains --code=\"4/...\""
+        required: true
+        default: ""
+      crd_pin:
+        description: "CRD PIN (6–12 digits)"
+        required: true
+        default: "123456"
+      runtime_minutes:
+        description: "How long to keep the session alive (max 360; default 355)"
         required: false
-        default: "vnc12345"
-      expose_with_cloudflared:
-        description: "Expose noVNC via Cloudflare (no account needed): true/false"
-        required: false
-        default: "true"
+        default: "355"
 
 jobs:
-  vnc:
-    runs-on: ubuntu-22.04
+  ubuntu_crd:
+    runs-on: ubuntu-22.04   # jammy is stable for desktop on GitHub runners
     timeout-minutes: 370
     env:
       USERNAME: Bullettemporary
       PASSWORD: Bullet@12345
-      RUNTIME_MINUTES: 355
-      VNC_DISPLAY: :1
-      VNC_GEOMETRY: 1366x768
-      VNC_DEPTH: 24
+      RUNTIME_MINUTES: ${{ inputs.runtime_minutes }}
 
     steps:
-      - name: Install XFCE + TigerVNC + noVNC
+      - name: Install XFCE desktop & basics
         shell: bash
         run: |
           set -e
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            xfce4 xfce4-goodies dbus-x11 dbus-user-session x11-xserver-utils \
-            tigervnc-standalone-server tigervnc-common tigervnc-tools \
-            novnc websockify curl jq unzip xorg locales
+            xfce4 xfce4-goodies xorg dbus-x11 dbus-user-session x11-xserver-utils \
+            curl wget unzip jq policykit-1 gvfs locales
           sudo locale-gen en_US.UTF-8
           echo 'LANG=en_US.UTF-8' | sudo tee /etc/default/locale >/dev/null
 
-          # User
+          # Create desktop user
           if ! id -u "$USERNAME" >/dev/null 2>&1; then
             sudo useradd -m -s /bin/bash "$USERNAME"
           fi
           echo "$USERNAME:$PASSWORD" | sudo chpasswd
           echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/$USERNAME >/dev/null
 
-          # Runtime dir for user bus
-          U=$(id -u "$USERNAME")
-          sudo install -d -m 700 -o "$USERNAME" -g "$USERNAME" "/run/user/$U"
+          # Default session for CRD
+          sudo -u "$USERNAME" bash -lc 'printf "%s\n" "exec /usr/bin/xfce4-session" > ~/.chrome-remote-desktop-session'
 
-          # xstartup without heredoc (YAML-safe)
-          sudo -u "$USERNAME" mkdir -p "/home/$USERNAME/.vnc"
-          sudo bash -c 'printf "%s\n" \
-            "#!/bin/sh" \
-            "unset SESSION_MANAGER" \
-            "unset DBUS_SESSION_BUS_ADDRESS" \
-            "export LANG=en_US.UTF-8" \
-            "export LC_ALL=en_US.UTF-8" \
-            "export XDG_CONFIG_DIRS=/etc/xdg:/etc" \
-            "export DESKTOP_SESSION=xfce" \
-            "export XDG_CURRENT_DESKTOP=XFCE" \
-            "exec dbus-run-session -- startxfce4" \
-            > /home/'"$USERNAME"'/.vnc/xstartup'
-          sudo chmod +x "/home/$USERNAME/.vnc/xstartup"
-          sudo chown -R "$USERNAME:$USERNAME" "/home/$USERNAME/.vnc"
-
-          # VNC password (TigerVNC uses first 8 chars)
-          VPASS="${{ inputs.vnc_password }}"
-          [ -z "$VPASS" ] && VPASS="vnc12345"
-          echo "$VPASS" | head -c 8 | sudo -u "$USERNAME" bash -c "vncpasswd -f > /home/$USERNAME/.vnc/passwd"
-          sudo chmod 600 "/home/$USERNAME/.vnc/passwd"
-
-          # Start VNC + noVNC
-          sudo -u "$USERNAME" vncserver "$VNC_DISPLAY" -geometry "$VNC_GEOMETRY" -depth "$VNC_DEPTH"
-          nohup websockify --web=/usr/share/novnc 6080 localhost:5901 >/tmp/novnc.log 2>&1 &
-          echo "✅ VNC on 5901 | noVNC → http://127.0.0.1:6080/"
-
-      - name: Optional – Expose noVNC via Cloudflare (no account needed)
-        if: ${{ inputs.expose_with_cloudflared == 'true' }}
+      - name: Install Chrome Remote Desktop host
         shell: bash
         run: |
           set -e
-          curl -L -o /tmp/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-          chmod +x /tmp/cloudflared
-          nohup /tmp/cloudflared tunnel --url http://localhost:6080 >/tmp/cloudflared.log 2>&1 &
-          for i in {1..30}; do
-            URL=$(grep -Eo 'https://[-a-z0-9.]+trycloudflare.com' /tmp/cloudflared.log | tail -n1 || true)
-            if [ -n "$URL" ]; then
-              echo "PUBLIC_NOVNC_URL=$URL" | tee -a "$GITHUB_ENV"
-              echo "🌐 Public noVNC: $URL"
-              break
-            fi
-            sleep 2
-          done
-          [ -n "$URL" ] || echo "⚠️  Cloudflare URL not found. See /tmp/cloudflared.log"
+          # Install CRD host .deb
+          curl -fsSL -o /tmp/chrome-remote-desktop.deb \
+            https://dl.google.com/linux/direct/chrome-remote-desktop_current_amd64.deb
+          sudo dpkg -i /tmp/chrome-remote-desktop.deb || sudo apt-get -f install -y
 
-      - name: Install Python 3 + pip
+          # Put user into CRD group
+          sudo usermod -aG chrome-remote-desktop "$USERNAME"
+
+      - name: Register CRD (use your code + PIN)
         shell: bash
         run: |
+          set -e
+          RAW="${{ inputs.crd_code }}"
+          PIN="${{ inputs.crd_pin }}"
+
+          # Basic validation
+          if ! echo "$PIN" | grep -Eq '^[0-9]{6,12}$'; then
+            echo "crd_pin must be 6–12 digits." >&2
+            exit 1
+          fi
+
+          # Extract code: accept either raw 4/... or full command containing --code="4/..."
+          CODE=""
+          if echo "$RAW" | grep -q -- '--code='; then
+            CODE="$(printf "%s" "$RAW" | sed -n 's/.*--code[= ]\"*\([^\"[:space:]]\+\)\"*.*/\1/p' | head -n1)"
+          elif echo "$RAW" | grep -q '^4/'; then
+            CODE="$RAW"
+          fi
+
+          if [ -z "$CODE" ]; then
+            echo "Could not detect CRD code. Paste raw 4/... or a full command containing --code=\"4/...\"" >&2
+            exit 1
+          fi
+
+          REDIR="https://remotedesktop.google.com/_/oauthredirect"
+          NAME="ubuntu-crd-${GITHUB_RUN_ID}"
+
+          # Start host for our user
+          sudo -u "$USERNAME" /opt/google/chrome-remote-desktop/start-host \
+            --code="$CODE" --redirect-url="$REDIR" --name="$NAME" --pin="$PIN"
+
+          # Enable and start the per-user service
+          sudo systemctl enable "chrome-remote-desktop@$USERNAME"
+          sudo systemctl restart "chrome-remote-desktop@$USERNAME"
+
+          echo "CRD registered. It should appear in your Chrome Remote Desktop list shortly."
+
+      - name: Install Python 3 + pip (useful tools)
+        shell: bash
+        run: |
+          set -e
           sudo apt-get update
           sudo apt-get install -y python3 python3-pip python3-venv python3-dev build-essential
           python3 -m pip install --upgrade pip wheel setuptools
+          python3 --version && pip3 --version
 
-      - name: Connection info
+      - name: Info & credentials
         shell: bash
         run: |
           echo "---------------------------------------------"
-          echo "User: $USERNAME / Pass: $PASSWORD"
-          echo "VNC password (first 8 chars used): '${{ inputs.vnc_password }}'"
-          echo "Local noVNC:  http://127.0.0.1:6080/"
-          if [ -n "${PUBLIC_NOVNC_URL:-}" ]; then
-            echo "Public noVNC: ${PUBLIC_NOVNC_URL}"
-          fi
+          echo "Login user: $USERNAME"
+          echo "Password  : $PASSWORD"
+          echo "CRD PIN   : (the one you entered: ${{ inputs.crd_pin }})"
+          echo "Session   : XFCE"
+          echo "---------------------------------------------"
+          echo "Open https://remotedesktop.google.com/access to connect."
+          echo "The machine name: ubuntu-crd-${GITHUB_RUN_ID}"
           echo "---------------------------------------------"
 
-      - name: Keep alive ~6 hours
+      - name: Keep alive (~6 hours)
         shell: bash
         run: |
-          END=$(( $(date +%s) + 60 * ${RUNTIME_MINUTES} ))
+          # sanitize runtime
+          R="${RUNTIME_MINUTES:-355}"
+          if ! echo "$R" | grep -Eq '^[0-9]+$'; then R=355; fi
+          if [ "$R" -lt 5 ] || [ "$R" -gt 360 ]; then R=355; fi
+
+          END=$(( $(date +%s) + 60 * R ))
+          echo "Keeping runner alive for $R minutes (until $(date -d @${END} +%T))."
           while [ $(date +%s) -lt $END ]; do
-            echo "running $(date +%T)"
+            systemctl is-active "chrome-remote-desktop@$USERNAME" >/dev/null 2>&1 && STATUS="CRD:active" || STATUS="CRD:starting"
+            echo "[$(date +%T)] ${STATUS} • alive"
             sleep 60
           done
 
@@ -126,5 +140,5 @@ jobs:
         if: failure()
         shell: bash
         run: |
-          echo "--- /tmp/novnc.log ---"; tail -n 200 /tmp/novnc.log || true
-          echo "--- /tmp/cloudflared.log ---"; tail -n 200 /tmp/cloudflared.log || true
+          echo "--- CRD journal ---"
+          sudo journalctl -u "chrome-remote-desktop@$USERNAME" --since "1 hour ago" -n 200 || true
