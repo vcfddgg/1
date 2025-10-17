@@ -1,4 +1,4 @@
-name: Xfce + Tailscale + VNC and xRDP (Stable v7)
+name: Xfce + Tailscale + VNC (Fast & Stable v8)
 
 on:
   workflow_dispatch:
@@ -11,17 +11,9 @@ on:
         required: false
         default: "runner"
       password:
-        description: "Password for the user, VNC and xRDP"
+        description: "Password for the user, VNC access"
         required: false
         default: "runner"
-      enable_vnc:
-        description: "Enable TigerVNC server"
-        type: boolean
-        default: true
-      enable_xrdp:
-        description: "Enable xRDP server"
-        type: boolean
-        default: true
       runtime_minutes:
         description: "Workflow runtime (max 355)"
         required: false
@@ -29,10 +21,6 @@ on:
 
 permissions:
   contents: read
-
-defaults:
-  run:
-    shell: bash
 
 jobs:
   gui-runner:
@@ -43,111 +31,75 @@ jobs:
       USERNAME: ${{ inputs.username }}
       PASSWORD: ${{ inputs.password }}
       TS_AUTHKEY: ${{ inputs.ts_authkey }}
-      ENABLE_VNC_IN: ${{ inputs.enable_vnc }}
-      ENABLE_XRDP_IN: ${{ inputs.enable_xrdp }}
-      RUNTIME_MINUTES_IN: ${{ inputs.runtime_minutes }}
+      RUNTIME_MINUTES: ${{ inputs.runtime_minutes }}
       HOSTNAME: xfce-${{ github.run_id }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Normalize inputs
-        id: cfg
+      - name: Install minimal desktop + VNC + tools
         run: |
-          set -euo pipefail
-          # runtime
-          runtime="${RUNTIME_MINUTES_IN:-355}"
-          if ! [[ "$runtime" =~ ^[0-9]+$ ]]; then runtime=355; fi
-          if [ "$runtime" -gt 355 ]; then runtime=355; fi
-          echo "runtime=$runtime" >> "$GITHUB_OUTPUT"
-          # booleans -> 'true'/'false'
-          nvnc="${ENABLE_VNC_IN}"; case "$nvnc" in true|True|1) nvnc=true ;; *) nvnc=false ;; esac
-          nxrdp="${ENABLE_XRDP_IN}"; case "$nxrdp" in true|True|1) nxrdp=true ;; *) nxrdp=false ;; esac
-          echo "enable_vnc=$nvnc"   >> "$GITHUB_OUTPUT"
-          echo "enable_xrdp=$nxrdp" >> "$GITHUB_OUTPUT"
-
-      - name: Install desktop and tools
-        run: |
-          set -euxo pipefail
+          set -eux
           echo "${USERNAME}:${PASSWORD}" | sudo chpasswd
-          echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/${USERNAME} >/dev/null
+          echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/${USERNAME}
           sudo apt-get update
-          sudo apt-get install -y xfce4 xfce4-goodies tigervnc-standalone-server xrdp xorgxrdp xvfb dbus-x11 curl jq net-tools x11-xserver-utils
+          # minimal xfce session (headless)
+          sudo apt-get install -y xfce4-session xfce4-panel xfce4-terminal xfdesktop4 xorg dbus-x11 tigervnc-standalone-server xvfb curl jq net-tools
 
-      - name: Start Xvfb display :99
+      - name: Start Xvfb and prepare display
         run: |
-          set -euxo pipefail
+          set -eux
           sudo Xvfb :99 -screen 0 1366x768x24 >/tmp/xvfb.log 2>&1 &
-          echo "DISPLAY=:99" | sudo tee -a /etc/environment >/dev/null
+          echo "DISPLAY=:99" | sudo tee -a /etc/environment
           export DISPLAY=:99
           sleep 2
 
-      - name: Configure xRDP (Xfce)
-        if: ${{ steps.cfg.outputs.enable_xrdp == 'true' }}
+      - name: Configure and start VNC
         run: |
-          set -euxo pipefail
-          sudo adduser "${USERNAME}" ssl-cert || true
-          sudo -u "${USERNAME}" bash -lc 'printf "%s\n" "startxfce4" > ~/.xsession'
-          # ensure startwm.sh starts Xfce (avoid black screen)
-          sudo sed -i 's/^test -r/#&/' /etc/xrdp/startwm.sh
-          printf "%s\n" "unset DBUS_SESSION_BUS_ADDRESS" | sudo tee -a /etc/xrdp/startwm.sh >/dev/null
-          printf "%s\n" "unset XDG_RUNTIME_DIR"        | sudo tee -a /etc/xrdp/startwm.sh >/dev/null
-          printf "%s\n" "export DISPLAY=:99"           | sudo tee -a /etc/xrdp/startwm.sh >/dev/null
-          printf "%s\n" "startxfce4 &"                 | sudo tee -a /etc/xrdp/startwm.sh >/dev/null
-          printf "%s\n" "wait"                         | sudo tee -a /etc/xrdp/startwm.sh >/dev/null
-          sudo systemctl enable xrdp || true
-          sudo systemctl restart xrdp || true
-
-      - name: Configure VNC (Xfce + Xvfb)
-        if: ${{ steps.cfg.outputs.enable_vnc == 'true' }}
-        run: |
-          set -euxo pipefail
-          sudo -u "${USERNAME}" mkdir -p "/home/${USERNAME}/.vnc"
-          # VNC password
-          sudo -u "${USERNAME}" bash -lc "printf '%s\n%s\n\n' '${PASSWORD}' '${PASSWORD}' | vncpasswd"
-          sudo -u "${USERNAME}" chmod 600 "/home/${USERNAME}/.vnc/passwd"
-          # xstartup that uses the pre-started Xvfb
-          sudo -u "${USERNAME}" bash -lc 'printf "%s\n" "#!/bin/sh" > ~/.vnc/xstartup'
-          sudo -u "${USERNAME}" bash -lc 'printf "%s\n" "unset SESSION_MANAGER" >> ~/.vnc/xstartup'
-          sudo -u "${USERNAME}" bash -lc 'printf "%s\n" "unset DBUS_SESSION_BUS_ADDRESS" >> ~/.vnc/xstartup'
-          sudo -u "${USERNAME}" bash -lc 'printf "%s\n" "export DISPLAY=:99" >> ~/.vnc/xstartup'
-          sudo -u "${USERNAME}" bash -lc 'printf "%s\n" "startxfce4 &" >> ~/.vnc/xstartup'
-          sudo -u "${USERNAME}" chmod +x "/home/${USERNAME}/.vnc/xstartup"
-          # restart VNC on :1 bound to Xvfb display
-          sudo -u "${USERNAME}" vncserver -kill :1 || true
-          sudo -u "${USERNAME}" vncserver :1 -geometry 1366x768 -localhost no
+          set -eux
+          mkdir -p /home/${USERNAME}/.vnc
+          printf '%s\n%s\n\n' "${PASSWORD}" "${PASSWORD}" | sudo -u ${USERNAME} vncpasswd
+          sudo -u ${USERNAME} bash -lc 'cat > ~/.vnc/xstartup <<EOF
+#!/bin/sh
+unset SESSION_MANAGER
+unset DBUS_SESSION_BUS_ADDRESS
+export DISPLAY=:99
+xfce4-session &
+EOF'
+          sudo -u ${USERNAME} chmod +x /home/${USERNAME}/.vnc/xstartup
+          sudo -u ${USERNAME} vncserver -kill :1 || true
+          sudo -u ${USERNAME} vncserver :1 -geometry 1366x768 -localhost no
+          echo "✅ VNC started on port 5901 (display :1)"
 
       - name: Install and start Tailscale
         run: |
-          set -euxo pipefail
+          set -eux
           curl -fsSL https://tailscale.com/install.sh | sh
           sudo nohup /usr/sbin/tailscaled --state=mem: --socket=/run/tailscaled.sock >/tmp/tailscaled.log 2>&1 &
           sudo -E tailscale up --reset --authkey="${TS_AUTHKEY}" --hostname="${HOSTNAME}" --ssh
           tailscale ip || true
 
-      - name: Show connection info
+      - name: Connection Info
         run: |
-          ts_ip4="$(tailscale ip -4 | head -n1 || echo N/A)"
+          ts_ip=$(tailscale ip -4 | head -n1 || echo "N/A")
           echo "===== CONNECTION INFO ====="
-          echo "Tailscale IPv4: ${ts_ip4}"
+          echo "Tailscale IPv4: ${ts_ip}"
           echo "Username: ${USERNAME}"
-          echo "Password: (hidden)"
-          echo "xRDP port: 3389 (if enabled)"
-          echo "VNC  port: 5901 (if enabled)"
-          echo "==========================="
+          echo "Password: ${PASSWORD}"
+          echo "VNC port: 5901"
+          echo "============================"
 
       - name: Keep alive
         run: |
-          mins="${{ steps.cfg.outputs.runtime }}"
-          echo "Keeping alive for ${mins} minutes..."
-          for i in $(seq 1 "${mins}"); do
-            echo "Minute $i / ${mins} - $(date -u +%F_%T)"
+          mins=${RUNTIME_MINUTES:-355}
+          echo "Keeping alive for $mins minutes..."
+          for i in $(seq 1 $mins); do
+            echo "Minute $i / $mins - $(date -u +%F_%T)"
             sleep 60
           done
 
       - name: Cleanup
         if: always()
         run: |
-          sudo -u "${USERNAME}" vncserver -kill :1 || true
-          sudo systemctl stop xrdp || true
+          sudo -u ${USERNAME} vncserver -kill :1 || true
