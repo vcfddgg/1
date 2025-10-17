@@ -1,87 +1,116 @@
-name: Ubuntu RDP (Jammy – XFCE fixed + Python + Tailscale/Ngrok)
+name: Ubuntu VNC Desktop (Jammy – XFCE + noVNC + Python)
 
 on:
   workflow_dispatch:
     inputs:
-      ts_authkey:
-        description: "Tailscale Auth Key (optional)"
+      vnc_password:
+        description: "VNC password (6-8 chars; default vnc12345)"
         required: false
-        default: ""
-      ngrok:
-        description: "Ngrok TOKEN or TOKEN,region (optional: us,in,eu,ap,au,sa,jp)"
+        default: "vnc12345"
+      expose_with_cloudflared:
+        description: "Expose noVNC via Cloudflare (no account needed): true/false"
         required: false
-        default: ""
+        default: "true"
 
 jobs:
-  rdp:
+  vnc:
     runs-on: ubuntu-22.04
     timeout-minutes: 370
     env:
       USERNAME: Bullettemporary
       PASSWORD: Bullet@12345
       RUNTIME_MINUTES: 355
+      VNC_DISPLAY: :1
+      VNC_GEOMETRY: 1366x768
+      VNC_DEPTH: 24
 
     steps:
-      - name: Install XFCE + XRDP (failsafe fixed)
+      - name: Install XFCE + TigerVNC + noVNC
         shell: bash
         run: |
           set -e
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            xfce4 xfce4-goodies xrdp xorgxrdp xfconf \
-            dbus-x11 dbus-user-session x11-xserver-utils policykit-1 gvfs xorg locales \
-            curl unzip jq
+            xfce4 xfce4-goodies dbus-x11 dbus-user-session x11-xserver-utils \
+            tigervnc-standalone-server tigervnc-common novnc websockify \
+            curl jq unzip xorg locales
 
           # Locale
           sudo locale-gen en_US.UTF-8
           echo 'LANG=en_US.UTF-8' | sudo tee /etc/default/locale >/dev/null
 
-          # Create RDP user
+          # Create desktop user
           if ! id -u "$USERNAME" >/dev/null 2>&1; then
             sudo useradd -m -s /bin/bash "$USERNAME"
           fi
           echo "$USERNAME:$PASSWORD" | sudo chpasswd
           echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/$USERNAME >/dev/null
 
-          # XRDP session selection for this user
-          echo "xfce4-session" | sudo tee /home/$USERNAME/.xsession >/dev/null
-          sudo chown "$USERNAME:$USERNAME" /home/$USERNAME/.xsession
-          sudo -u "$USERNAME" touch /home/$USERNAME/.Xauthority
-
-          # Allow XRDP to start Xorg
-          echo "allowed_users=anybody" | sudo tee /etc/X11/Xwrapper.config >/dev/null
-
-          # Ensure /run/user/<uid> exists (for user D-Bus)
+          # Ensure user runtime dir (for user D-Bus)
           U=$(id -u "$USERNAME")
           sudo install -d -m 700 -o "$USERNAME" -g "$USERNAME" "/run/user/$U"
 
-          # Write startwm.sh with printf (no heredoc = YAML-safe)
+          # Write VNC xstartup that launches XFCE under dbus-run-session
+          sudo -u "$USERNAME" mkdir -p /home/$USERNAME/.vnc
           sudo bash -c 'printf "%s\n" \
             "#!/bin/sh" \
+            "unset SESSION_MANAGER" \
+            "unset DBUS_SESSION_BUS_ADDRESS" \
             "export LANG=en_US.UTF-8" \
             "export LC_ALL=en_US.UTF-8" \
             "export XDG_CONFIG_DIRS=/etc/xdg:/etc" \
-            "export XDG_DATA_DIRS=/usr/share:/usr/local/share" \
             "export DESKTOP_SESSION=xfce" \
             "export XDG_CURRENT_DESKTOP=XFCE" \
-            "unset DBUS_SESSION_BUS_ADDRESS" \
-            "[ -z \"\\$XDG_RUNTIME_DIR\" ] && export XDG_RUNTIME_DIR=/run/user/\\$(id -u)" \
-            "[ -d \"\\$XDG_RUNTIME_DIR\" ] || mkdir -p \"\\$XDG_RUNTIME_DIR\"" \
-            "chmod 700 \"\\$XDG_RUNTIME_DIR\" || true" \
-            "if command -v dbus-run-session >/dev/null 2>&1; then" \
-            "  exec dbus-run-session -- /usr/bin/startxfce4" \
-            "else" \
-            "  exec dbus-launch xfce4-session" \
-            "fi" \
-            > /etc/xrdp/startwm.sh'
-          sudo chmod +x /etc/xrdp/startwm.sh
+            "" \
+            "# Start XFCE inside a fresh user D-Bus session" \
+            "exec dbus-run-session -- startxfce4" \
+            > /home/'"$USERNAME"'/.vnc/xstartup'
+          sudo chmod +x /home/$USERNAME/.vnc/xstartup
+          sudo chown -R "$USERNAME:$USERNAME" /home/$USERNAME/.vnc
 
-          # Enable XRDP
-          sudo adduser xrdp ssl-cert || true
-          sudo systemctl enable xrdp
-          sudo systemctl restart xrdp xrdp-sesman
+          # Set VNC password (TigerVNC uses only the first 8 chars)
+          VPASS="${{ inputs.vnc_password }}"
+          [ -z "$VPASS" ] && VPASS="vnc12345"
+          echo "$VPASS" | head -c 8 | sudo -u "$USERNAME" vncpasswd -f > /home/$USERNAME/.vnc/passwd
+          sudo chmod 600 /home/$USERNAME/.vnc/passwd
 
-          echo "RDP ready: user=$USERNAME pass=$PASSWORD port=3389"
+          # Start the VNC server
+          sudo -u "$USERNAME" vncserver "$VNC_DISPLAY" -geometry "$VNC_GEOMETRY" -depth "$VNC_DEPTH"
+
+          # Start noVNC (web client) on :6080 -> proxies to localhost 5901
+          # novnc package provides 'websockify' and '/usr/share/novnc'
+          nohup websockify --web=/usr/share/novnc 6080 localhost 5901 >/tmp/novnc.log 2>&1 &
+
+          # Show endpoints
+          echo "VNC server running on TCP 5901 (display $VNC_DISPLAY)"
+          echo "noVNC running on http://127.0.0.1:6080/ (will be tunneled if enabled)"
+
+      - name: Optional – Expose noVNC via Cloudflare (no account needed)
+        if: ${{ inputs.expose_with_cloudflared == 'true' }}
+        shell: bash
+        run: |
+          set -e
+          # Download a static cloudflared
+          curl -sSL -o /tmp/cloudflared.tgz https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.tgz
+          tar -xzf /tmp/cloudflared.tgz -C /tmp
+          chmod +x /tmp/cloudflared
+
+          # Start a tunnel to local noVNC (port 6080). 'trycloudflare.com' gives a random URL.
+          nohup /tmp/cloudflared tunnel --url http://localhost:6080 >/tmp/cloudflared.log 2>&1 &
+
+          # Wait and print the public URL
+          for i in {1..20}; do
+            URL=$(grep -Eo 'https://[-a-z0-9.]+trycloudflare.com' /tmp/cloudflared.log | tail -n1 || true)
+            if [ -n "$URL" ]; then
+              echo "PUBLIC_NOVNC_URL=$URL" | tee -a $GITHUB_ENV
+              echo "noVNC public URL: $URL"
+              break
+            fi
+            sleep 2
+          done
+          if [ -z "$URL" ]; then
+            echo "Could not detect Cloudflare URL. Check /tmp/cloudflared.log"
+          fi
 
       - name: Install Python 3 + pip
         shell: bash
@@ -92,30 +121,22 @@ jobs:
           python3 -m pip install --upgrade pip wheel setuptools
           python3 --version && pip3 --version
 
-      - name: Optional - Tailscale
-        if: ${{ inputs.ts_authkey != '' }}
+      - name: Connection info
         shell: bash
         run: |
-          set -e
-          curl -fsSL https://tailscale.com/install.sh | sh
-          sudo tailscale up --authkey "${{ inputs.ts_authkey }}" --hostname "ubuntu-rdp-jammy" --accept-dns=true --accept-routes=true
-          echo "Tailscale IPv4: $(tailscale ip -4 | head -n1 || true)"
-
-      - name: Optional - Ngrok TCP 3389
-        if: ${{ inputs.ngrok != '' }}
-        shell: bash
-        run: |
-          set -e
-          RAW="${{ inputs.ngrok }}"
-          TOK=$(echo "$RAW" | cut -d',' -f1 | awk '{print $1}')
-          REG=$(echo "$RAW" | cut -d',' -f2)
-          [ -z "$REG" ] && REG="in"
-          curl -sSL -o ngrok.zip https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-stable-linux-amd64.zip
-          unzip -o ngrok.zip
-          ./ngrok authtoken "$TOK"
-          nohup ./ngrok tcp 3389 --region "$REG" >/tmp/ngrok.log 2>&1 &
-          sleep 8
-          curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[]?.public_url' || true
+          echo "---------------------------------------------"
+          echo "VNC connection:"
+          echo "  Host: 127.0.0.1 (direct inbound not reachable on GitHub runners)"
+          echo "  Port: 5901"
+          echo "  Password: (first 8 chars of your input) -> '${{ inputs.vnc_password }}'"
+          echo
+          echo "noVNC (browser) local:  http://127.0.0.1:6080/"
+          if [ -n "${PUBLIC_NOVNC_URL:-}" ]; then
+            echo "noVNC (public): ${PUBLIC_NOVNC_URL}"
+          else
+            echo "noVNC public URL not available (Cloudflare disabled or failed)."
+          fi
+          echo "---------------------------------------------"
 
       - name: Keep alive ~6 hours
         shell: bash
@@ -126,11 +147,9 @@ jobs:
             sleep 60
           done
 
-      - name: XRDP logs on failure
+      - name: Logs on failure
         if: failure()
         shell: bash
         run: |
-          echo "--- /var/log/xrdp.log ---"
-          sudo tail -n 150 /var/log/xrdp.log || true
-          echo "--- /var/log/xrdp-sesman.log ---"
-          sudo tail -n 150 /var/log/xrdp-sesman.log || true
+          echo "--- /tmp/novnc.log ---"; tail -n 200 /tmp/novnc.log || true
+          echo "--- /tmp/cloudflared.log ---"; tail -n 200 /tmp/cloudflared.log || true
