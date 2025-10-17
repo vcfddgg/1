@@ -1,4 +1,4 @@
-name: Ubuntu Desktop (GNOME Flashback + VNC + Tailscale)
+name: Ubuntu GNOME Flashback + VNC + Tailscale (Stable)
 
 on:
   workflow_dispatch:
@@ -23,7 +23,7 @@ permissions:
   contents: read
 
 jobs:
-  desktop:
+  gnome-vnc:
     runs-on: ubuntu-latest
     timeout-minutes: 370
     env:
@@ -34,39 +34,44 @@ jobs:
       RUNTIME_MINUTES: ${{ github.event.inputs.runtime_minutes || '355' }}
 
     steps:
-      - name: Setup user
+      - name: Setup user and sudo
         run: |
           echo "${USERNAME}:${PASSWORD}" | sudo chpasswd
           echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/${USERNAME}
 
-      - name: Install GNOME Flashback + TigerVNC
+      - name: Install GNOME Flashback and VNC
         run: |
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            gnome-session-flashback gnome-panel metacity nautilus \
-            gnome-terminal dbus-x11 tigervnc-standalone-server tigervnc-common tigervnc-tools \
-            x11-xserver-utils policykit-1
+            gnome-session-flashback gnome-panel metacity nautilus gnome-terminal \
+            dbus-x11 tigervnc-standalone-server tigervnc-common tigervnc-tools \
+            x11-xserver-utils mesa-utils policykit-1
 
-          # Disable Wayland, force Xorg
+          # Disable Wayland (force Xorg)
           sudo sed -i 's/^#\?WaylandEnable=.*/WaylandEnable=false/' /etc/gdm3/custom.conf || true
 
           # Force software rendering
-          sudo apt-get install -y -qq mesa-utils
-          sudo bash -c 'echo "export LIBGL_ALWAYS_SOFTWARE=1" >> /etc/environment'
-          sudo bash -c 'echo "export GDK_BACKEND=x11" >> /etc/environment'
+          echo "export LIBGL_ALWAYS_SOFTWARE=1" | sudo tee -a /etc/environment
+          echo "export GDK_BACKEND=x11" | sudo tee -a /etc/environment
 
-          # VNC setup
+          # Create Xauthority before start
+          sudo -u ${USERNAME} touch /home/${USERNAME}/.Xauthority
+          sudo chown ${USERNAME}:${USERNAME} /home/${USERNAME}/.Xauthority
+
+          # Set VNC password
           sudo -u ${USERNAME} mkdir -p /home/${USERNAME}/.vnc
           echo "${PASSWORD}" | vncpasswd -f | sudo tee /home/${USERNAME}/.vnc/passwd >/dev/null
           sudo chmod 600 /home/${USERNAME}/.vnc/passwd
           sudo chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}/.vnc
 
-          # xstartup file
+          # Create working xstartup file
           cat <<'EOF' | sudo tee /home/${USERNAME}/.vnc/xstartup >/dev/null
           #!/bin/sh
           unset SESSION_MANAGER
           unset DBUS_SESSION_BUS_ADDRESS
           export XDG_SESSION_TYPE=x11
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          mkdir -p "$XDG_RUNTIME_DIR"; chmod 700 "$XDG_RUNTIME_DIR" || true
           export XAUTHORITY="$HOME/.Xauthority"
           export LIBGL_ALWAYS_SOFTWARE=1
           export GDK_BACKEND=x11
@@ -81,30 +86,30 @@ jobs:
         run: |
           curl -fsSL https://tailscale.com/install.sh | sudo sh
           sudo tailscale up --authkey "${TS_AUTHKEY}" --hostname "${TS_HOSTNAME}"
-          sudo tailscale status || true
+          sudo tailscale ip -4
 
-      - name: Start VNC Server
+      - name: Start TigerVNC Server
         run: |
           sudo -u ${USERNAME} vncserver -kill :1 >/dev/null 2>&1 || true
           sudo -u ${USERNAME} vncserver :1 -geometry 1280x800 -depth 24 -localhost no
-          echo "VNC started on port 5901"
-          tail -n 20 /home/${USERNAME}/.vnc/*.log || true
+          echo "VNC started successfully."
+          tail -n 30 /home/${USERNAME}/.vnc/*.log || true
 
       - name: Connection Info
         run: |
           TS4=$(tailscale ip -4 | head -n1)
           echo "----------------------------------------------------"
-          echo "Username : ${USERNAME}"
-          echo "Password : ${PASSWORD}"
-          echo "VNC Port : 5901"
-          echo "Connect  : ${TS4}:5901"
+          echo "User      : ${USERNAME} / ${PASSWORD}"
+          echo "VNC       : Enabled (display :1, port 5901)"
+          echo "Password  : ${PASSWORD}"
+          echo "Tailscale : ${TS4}:5901"
+          echo "Connect   : With any VNC viewer to the above IP"
           echo "----------------------------------------------------"
 
-      - name: Keep Alive (~6 hours)
+      - name: Keep Alive (~6h)
         run: |
-          R="${RUNTIME_MINUTES:-355}"
-          END=$(( $(date +%s) + 60*R ))
+          END=$(( $(date +%s) + 60*${RUNTIME_MINUTES:-355} ))
           while [ "$(date +%s)" -lt "$END" ]; do
-            echo "[ $(date +%T) ] alive"
+            echo "[ $(date +%T) ] alive • VNC"
             sleep 60
           done
