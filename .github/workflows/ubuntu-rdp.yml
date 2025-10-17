@@ -1,42 +1,26 @@
-name: Ubuntu GNOME + (VNC / XRDP / CRD) with optional Tailscale
+name: Ubuntu GNOME + VNC (Tailscale, 6h)
 
 on:
   workflow_dispatch:
     inputs:
-      enable_vnc:
-        description: "Enable TigerVNC + GNOME"
-        required: true
-        default: "true"
-      enable_xrdp:
-        description: "Enable XRDP + GNOME"
-        required: true
-        default: "false"
-      enable_crd:
-        description: "Enable Chrome Remote Desktop (CRD)"
-        required: true
-        default: "false"
-
       tailscale_authkey:
-        description: "(Optional) Tailscale auth key (no 'Bearer') to reach VNC/XRDP"
-        required: false
-        default: ""
-
-      vnc_password:
-        description: "(VNC) Password (first 8 chars used)"
+        description: "Tailscale Auth Key (ephemeral or reusable)"
+        required: true
+      username:
+        description: "Login username"
         required: false
         default: "runner"
-
-      crd_code:
-        description: "(CRD) Paste Debian Linux command containing --code=\"4/...\" OR just the raw 4/..."
+      password:
+        description: "Login password"
         required: false
-        default: ""
-      crd_pin:
-        description: "(CRD) PIN (6–12 digits)"
-        required: false
-        default: "123456"
-
+        default: "runner"
+      desktop:
+        description: "Desktop (gnome=stable flashback, gnome-classic, xfce)"
+        type: choice
+        options: [gnome, gnome-classic, xfce]
+        default: "gnome"
       runtime_minutes:
-        description: "Keep alive minutes (5–360; default 355)"
+        description: "Minutes to keep session alive (max 360)"
         required: false
         default: "355"
 
@@ -44,188 +28,110 @@ permissions:
   contents: read
 
 jobs:
-  gnome-merged:
-    runs-on: ubuntu-22.04
+  vnc:
+    runs-on: ubuntu-latest
     timeout-minutes: 370
     env:
-      USERNAME: runner
-      PASSWORD: runner
-      HOST_PREFIX: gnome-merged
-      RUNTIME_MINUTES: ${{ inputs.runtime_minutes }}
+      USERNAME: ${{ github.event.inputs.username || 'runner' }}
+      PASSWORD: ${{ github.event.inputs.password || 'runner' }}
+      TS_AUTHKEY: ${{ github.event.inputs.tailscale_authkey }}
+      TS_HOSTNAME: gh-gnome-vnc-${{ github.run_id }}
+      RUNTIME_MINUTES: ${{ github.event.inputs.runtime_minutes || '355' }}
+      DESKTOP: ${{ github.event.inputs.desktop || 'gnome' }}
 
     steps:
-      - name: Prep user and basics
-        shell: bash
+      - name: Prepare user + sudo
         run: |
-          set -e
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            dbus-x11 dbus-user-session x11-xserver-utils curl wget jq locales
-          sudo locale-gen en_US.UTF-8
-          echo 'LANG=en_US.UTF-8' | sudo tee /etc/default/locale >/dev/null
+          set -euo pipefail
           echo "${USERNAME}:${PASSWORD}" | sudo chpasswd
-          echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/${USERNAME} >/dev/null
-          U=$(id -u "${USERNAME}")
-          sudo install -d -m 700 -o "${USERNAME}" -g "${USERNAME}" "/run/user/${U}" || true
+          echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/${USERNAME}
 
-      # If CRD enabled, register FIRST so short-lived codes don’t expire.
-      - name: Install CRD host (if enabled)
-        if: ${{ inputs.enable_crd == 'true' }}
-        shell: bash
+      - name: Install base desktop bits (GNOME or XFCE) + VNC
         run: |
-          set -e
-          curl -fsSL -o /tmp/chrome-remote-desktop.deb \
-            https://dl.google.com/linux/direct/chrome-remote-desktop_current_amd64.deb
-          sudo dpkg -i /tmp/chrome-remote-desktop.deb || sudo apt-get -f install -y
-          sudo usermod -aG chrome-remote-desktop "${USERNAME}"
+          set -euo pipefail
+          sudo apt-get update -qq
 
-      - name: Register CRD (if enabled)
-        if: ${{ inputs.enable_crd == 'true' }}
-        shell: bash
-        run: |
-          set -e
-          RAW="${{ inputs.crd_code }}"
-          PIN="${{ inputs.crd_pin }}"
-          if ! echo "$PIN" | grep -Eq '^[0-9]{6,12}$'; then
-            echo "crd_pin must be 6–12 digits." >&2; exit 1
-          fi
-          CODE=""
-          if echo "$RAW" | grep -q -- '--code='; then
-            CODE="$(printf "%s" "$RAW" | sed -n 's/.*--code[= ]\"*\([^\"[:space:]]\+\)\"*.*/\1/p' | head -n1)"
-          elif echo "$RAW" | grep -q '^4/'; then
-            CODE="$RAW"
-          fi
-          if [ -z "$CODE" ]; then
-            echo "CRD enabled but no valid code provided (crd_code). Skipping CRD setup." ; exit 0
-          fi
-          REDIR="https://remotedesktop.google.com/_/oauthredirect"
-          NAME="${HOST_PREFIX}-crd-${GITHUB_RUN_ID}"
-          sudo -u "${USERNAME}" bash -lc 'printf "%s\n" "exec /usr/bin/gnome-session --session=ubuntu" > ~/.chrome-remote-desktop-session'
-          sudo -u "${USERNAME}" /opt/google/chrome-remote-desktop/start-host \
-            --code="$CODE" --redirect-url="$REDIR" --name="$NAME" --pin="$PIN"
-          sudo systemctl enable "chrome-remote-desktop@${USERNAME}"
-          sudo systemctl restart "chrome-remote-desktop@${USERNAME}"
-          echo "CRD_NAME=${NAME}" >> "$GITHUB_ENV"
-
-      - name: Install official Ubuntu GNOME desktop
-        shell: bash
-        run: |
-          set -e
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ubuntu-desktop gnome-session gdm3
-          sudo systemctl enable gdm3
-          sudo systemctl restart gdm3 || true
-
-      - name: Install VNC stack (if enabled)
-        if: ${{ inputs.enable_vnc == 'true' }}
-        shell: bash
-        run: |
-          set -e
+          # Always install TigerVNC server + helpers
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            tigervnc-standalone-server tigervnc-common tigervnc-tools
-          # Password (first 8 chars)
-          VPASS="${{ inputs.vnc_password }}"
-          [ -z "$VPASS" ] && VPASS="${PASSWORD}"
-          sudo -u "${USERNAME}" mkdir -p "/home/${USERNAME}/.vnc"
-          printf "%s" "$VPASS" | head -c 8 | sudo -u "${USERNAME}" bash -lc 'vncpasswd -f > ~/.vnc/passwd'
-          sudo chmod 600 "/home/${USERNAME}/.vnc/passwd"
-          # xstartup for GNOME via dbus
-          sudo bash -c "printf '%s\n' \
-            '#!/bin/sh' \
-            'unset SESSION_MANAGER' \
-            'unset DBUS_SESSION_BUS_ADDRESS' \
-            'export LANG=en_US.UTF-8' \
-            'export LC_ALL=en_US.UTF-8' \
-            'exec dbus-run-session -- gnome-session --session=ubuntu' \
-            > /home/${USERNAME}/.vnc/xstartup"
-          sudo chmod +x "/home/${USERNAME}/.vnc/xstartup"
-          sudo chown -R "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.vnc"
-          # Start on :1, reachable over Tailscale once up
-          sudo -u "${USERNAME}" vncserver :1 -geometry 1366x768 -depth 24 -localhost no
-          echo "VNC_STARTED=1" >> "$GITHUB_ENV"
+            tigervnc-standalone-server tigervnc-common tigervnc-tools \
+            dbus-x11 xorg
 
-      - name: Install XRDP (if enabled)
-        if: ${{ inputs.enable_xrdp == 'true' }}
-        shell: bash
-        run: |
-          set -e
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xrdp xorgxrdp
-          echo "gnome-session --session=ubuntu" | sudo tee /home/${USERNAME}/.xsession >/dev/null
+          if [ "${DESKTOP}" = "xfce" ]; then
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+              xfce4 xfce4-goodies
+            echo "exec startxfce4" | sudo tee /home/${USERNAME}/.xsession >/dev/null
+          else
+            # Official GNOME stack
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+              gnome-session gnome-shell gnome-terminal gnome-control-center \
+              gdm3 gnome-tweaks gnome-shell-extension-prefs
+
+            # Headless stability: use Xorg, disable Wayland and shell extensions, software-friendly settings
+            sudo sed -i 's/^#\?WaylandEnable=.*/WaylandEnable=false/' /etc/gdm3/custom.conf || true
+            sudo bash -lc "mkdir -p /home/${USERNAME}/.config"
+
+            # Disable user extensions, animations, idle, etc. (prevents 'Oh no!' crashes)
+            sudo -u ${USERNAME} dbus-launch gsettings set org.gnome.shell disable-user-extensions true
+            sudo -u ${USERNAME} dbus-launch gsettings set org.gnome.desktop.interface enable-animations false
+            sudo -u ${USERNAME} dbus-launch gsettings set org.gnome.desktop.session idle-delay 0
+            sudo -u ${USERNAME} dbus-launch gsettings set org.gnome.mutter check-alive-timeout 0
+
+            if [ "${DESKTOP}" = "gnome-classic" ]; then
+              # GNOME Flashback (metacity) is very robust in virtual/CPU rendering
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gnome-session-flashback
+              echo "exec dbus-launch gnome-session --session=gnome-flashback-metacity" | sudo tee /home/${USERNAME}/.xsession >/dev/null
+            else
+              # Default 'gnome' option -> also use Flashback (stable) while remaining GNOME
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gnome-session-flashback
+              echo "exec dbus-launch gnome-session --session=gnome-flashback-metacity" | sudo tee /home/${USERNAME}/.xsession >/dev/null
+            fi
+          fi
+
           sudo chown ${USERNAME}:${USERNAME} /home/${USERNAME}/.xsession
-          sudo systemctl enable xrdp
-          sudo systemctl restart xrdp
-          echo "XRDP_STARTED=1" >> "$GITHUB_ENV"
 
-      - name: Install & bring up Tailscale (optional)
-        if: ${{ inputs.tailscale_authkey != '' }}
-        shell: bash
+          # VNC password
+          sudo -u ${USERNAME} mkdir -p /home/${USERNAME}/.vnc
+          echo "${PASSWORD}" | vncpasswd -f | sudo tee /home/${USERNAME}/.vnc/passwd >/dev/null
+          sudo chmod 600 /home/${USERNAME}/.vnc/passwd
+          sudo chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}/.vnc
+
+      - name: Install + bring up Tailscale
         run: |
-          set -e
+          set -euo pipefail
           curl -fsSL https://tailscale.com/install.sh | sudo sh
-          HN="${HOST_PREFIX}-${GITHUB_RUN_ID}"
-          sudo tailscale logout || true
-          sudo tailscale up --authkey "${{ inputs.tailscale_authkey }}" --hostname "${HN}" --accept-dns=true --accept-routes=true
-          TS4=$(tailscale ip -4 | head -n1 || true)
-          TS6=$(tailscale ip -6 | head -n1 || true)
-          echo "TS_IPv4=${TS4}" >> "$GITHUB_ENV"
-          echo "TS_IPv6=${TS6}" >> "$GITHUB_ENV"
+          sudo tailscale up --authkey "${TS_AUTHKEY}" --hostname "${TS_HOSTNAME}"
+          sudo tailscale status || true
+
+      - name: Start TigerVNC on :1 (5901)
+        run: |
+          set -euo pipefail
+          # Start a clean VNC session reachable over the private Tailscale IP
+          sudo -u ${USERNAME} vncserver -kill :1 >/dev/null 2>&1 || true
+          sudo -u ${USERNAME} vncserver :1 -geometry 1280x800 -depth 24 -localhost no
+          sleep 2
+          # Show processes
+          pgrep -a Xvnc || true
 
       - name: Connection info
-        shell: bash
         run: |
-          echo "---------------------------------------------"
-          echo "User        : ${USERNAME}  /  ${PASSWORD}"
-          if [ "${{ inputs.enable_crd }}" = "true" ] && [ -n "${CRD_NAME:-}" ]; then
-            echo "CRD         : Enabled (PIN: ${{ inputs.crd_pin }})"
-            echo "CRD Console : https://remotedesktop.google.com/access  (name: ${CRD_NAME})"
-          else
-            echo "CRD         : Disabled"
-          fi
-          if [ "${{ inputs.enable_vnc }}" = "true" ]; then
-            echo "VNC         : Enabled (port 5901, display :1)"
-            echo "VNC pass    : ${{ inputs.vnc_password }}"
-          else
-            echo "VNC         : Disabled"
-          fi
-          if [ "${{ inputs.enable_xrdp }}" = "true" ]; then
-            echo "XRDP        : Enabled (port 3389)"
-          else
-            echo "XRDP        : Disabled"
-          fi
-          if [ -n "${TS_IPv4:-}" ]; then
-            echo "Tailscale   : ${TS_IPv4} (IPv4)  ${TS_IPv6:-n/a} (IPv6)"
-            if [ "${{ inputs.enable_vnc }}" = "true" ]; then
-              echo " → VNC:   ${TS_IPv4}:5901"
-            fi
-            if [ "${{ inputs.enable_xrdp }}" = "true" ]; then
-              echo " → XRDP:  ${TS_IPv4}:3389"
-            fi
-          else
-            echo "Tailscale   : not enabled (no inbound ports on GitHub without it)"
-          fi
-          echo "---------------------------------------------"
+          set -euo pipefail
+          TS4=$(tailscale ip -4 | head -n1 || true)
+          echo "----------------------------------------------------"
+          echo "User      : ${USERNAME} / ${PASSWORD}"
+          echo "Desktop   : ${DESKTOP}"
+          echo "VNC       : Enabled (port 5901, display :1)"
+          echo "VNC pass  : ${PASSWORD}"
+          echo "Tailscale : ${TS4}:5901"
+          echo "Tip: use any VNC client to connect to the Tailscale IP."
+          echo "----------------------------------------------------"
 
       - name: Keep alive (~6 hours)
-        shell: bash
         run: |
+          set -euo pipefail
           R="${RUNTIME_MINUTES:-355}"
-          if ! echo "$R" | grep -Eq '^[0-9]+$'; then R=355; fi
-          if [ "$R" -lt 5 ] || [ "$R" -gt 360 ]; then R=355; fi
-          END=$(( $(date +%s) + 60 * R ))
+          if [ "$R" -gt 360 ] || [ "$R" -lt 5 ]; then R=355; fi
+          END=$(( $(date +%s) + 60*R ))
           while [ "$(date +%s)" -lt "$END" ]; do
-            MSG="alive"
-            if pgrep -x Xtigervnc >/dev/null 2>&1; then MSG="$MSG • VNC"; fi
-            if systemctl is-active xrdp >/dev/null 2>&1; then MSG="$MSG • XRDP"; fi
-            if systemctl is-active "chrome-remote-desktop@${USERNAME}" >/dev/null 2>&1; then MSG="$MSG • CRD"; fi
-            echo "[ $(date +%T) ] $MSG"
+            echo "[ $(date +%T) ] alive • VNC"
             sleep 60
           done
-
-      - name: Logs on failure
-        if: failure()
-        shell: bash
-        run: |
-          echo "--- CRD journal (last hour) ---"
-          sudo journalctl -u "chrome-remote-desktop@${USERNAME}" --since "1 hour ago" -n 200 || true
-          echo "--- XRDP logs ---"
-          sudo tail -n 200 /var/log/xrdp.log || true
-          sudo tail -n 200 /var/log/xrdp-sesman.log || true
