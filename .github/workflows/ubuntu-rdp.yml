@@ -1,4 +1,4 @@
-name: Xfce + Tailscale + VNC (Fast v9, YAML-safe)
+name: Docker Desktop (LXDE) + VNC + Tailscale (No-Hang)
 
 on:
   workflow_dispatch:
@@ -6,14 +6,14 @@ on:
       ts_authkey:
         description: "Tailscale Auth key (paste here)"
         required: true
-      username:
-        description: "Linux username for desktop login"
+      vnc_password:
+        description: "VNC password (for viewer auth)"
         required: false
         default: "runner"
-      password:
-        description: "Password for the user and VNC"
+      resolution:
+        description: "Desktop resolution (e.g., 1366x768)"
         required: false
-        default: "runner"
+        default: "1366x768"
       runtime_minutes:
         description: "Workflow runtime (max 355)"
         required: false
@@ -23,88 +23,78 @@ permissions:
   contents: read
 
 jobs:
-  gui-runner:
+  desktop:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
     env:
-      USERNAME: ${{ inputs.username }}
-      PASSWORD: ${{ inputs.password }}
       TS_AUTHKEY: ${{ inputs.ts_authkey }}
+      VNC_PASSWORD: ${{ inputs.vnc_password }}
+      RESOLUTION: ${{ inputs.resolution }}
       RUNTIME_MINUTES: ${{ inputs.runtime_minutes }}
-      HOSTNAME: xfce-${{ github.run_id }}
+      HOSTNAME: dockervnc-${{ github.run_id }}
 
     steps:
       - name: "Checkout"
         uses: actions/checkout@v4
 
-      - name: "Install minimal desktop, VNC, tools"
+      - name: "Start Docker desktop+VNC container"
         shell: bash
         run: |
           set -eux
-          echo "${USERNAME}:${PASSWORD}" | sudo chpasswd
-          echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/${USERNAME} >/dev/null
-          sudo apt-get update
-          # Lightweight Xfce stack + Xorg + VNC + Xvfb
-          sudo apt-get install -y \
-            xfce4-session xfce4-panel xfce4-terminal xfdesktop4 \
-            xorg dbus-x11 tigervnc-standalone-server xvfb \
-            curl jq net-tools x11-xserver-utils
+          # Pull lightweight Ubuntu desktop with built-in VNC
+          docker pull dorowu/ubuntu-desktop-lxde-vnc:latest
+          # Run container exposing VNC on host port 5901
+          docker run -d --name desktop \
+            -e VNC_PASSWORD="${VNC_PASSWORD}" \
+            -e RESOLUTION="${RESOLUTION}" \
+            -p 5901:5901 \
+            dorowu/ubuntu-desktop-lxde-vnc:latest
+          # Health check: wait for VNC to listen
+          for i in $(seq 1 30); do
+            ss -lnt '( sport = :5901 )' | grep -q 5901 && { echo "VNC is listening on 5901"; break; }
+            sleep 1
+          done
 
-      - name: "Start Xvfb display :99"
-        shell: bash
-        run: |
-          set -eux
-          sudo Xvfb :99 -screen 0 1366x768x24 >/tmp/xvfb.log 2>&1 &
-          echo "DISPLAY=:99" | sudo tee -a /etc/environment >/dev/null
-          export DISPLAY=:99
-          sleep 2
-
-      - name: "Configure and start VNC"
-        shell: bash
-        run: |
-          set -eux
-          # VNC password store
-          sudo -u "${USERNAME}" mkdir -p "/home/${USERNAME}/.vnc"
-          sudo -u "${USERNAME}" bash -lc "printf '%s\n%s\n\n' '${PASSWORD}' '${PASSWORD}' | vncpasswd"
-          sudo -u "${USERNAME}" chmod 600 "/home/${USERNAME}/.vnc/passwd"
-
-          # xstartup script (no heredocs)
-          sudo -u "${USERNAME}" bash -lc 'printf "%s\n" "#!/bin/sh" > ~/.vnc/xstartup'
-          sudo -u "${USERNAME}" bash -lc 'printf "%s\n" "unset SESSION_MANAGER" >> ~/.vnc/xstartup'
-          sudo -u "${USERNAME}" bash -lc 'printf "%s\n" "unset DBUS_SESSION_BUS_ADDRESS" >> ~/.vnc/xstartup'
-          sudo -u "${USERNAME}" bash -lc 'printf "%s\n" "export DISPLAY=:99" >> ~/.vnc/xstartup'
-          sudo -u "${USERNAME}" bash -lc 'printf "%s\n" "xfce4-session &" >> ~/.vnc/xstartup'
-          sudo -u "${USERNAME}" chmod +x "/home/${USERNAME}/.vnc/xstartup"
-
-          # Start VNC on :1 (port 5901)
-          sudo -u "${USERNAME}" vncserver -kill :1 || true
-          sudo -u "${USERNAME}" vncserver :1 -geometry 1366x768 -localhost no
-
-      - name: "Install and start Tailscale"
+      - name: "Install and start Tailscale (userspace)"
         shell: bash
         run: |
           set -eux
           curl -fsSL https://tailscale.com/install.sh | sh
-          sudo nohup /usr/sbin/tailscaled --state=mem: --socket=/run/tailscaled.sock >/tmp/tailscaled.log 2>&1 &
-          sudo -E tailscale up --reset --authkey="${TS_AUTHKEY}" --hostname="${HOSTNAME}" --ssh
+          # Run tailscaled in userspace (no kernel tun required on GH runners)
+          sudo nohup /usr/sbin/tailscaled \
+            --state=mem: \
+            --socket=/run/tailscaled.sock \
+            --tun=userspace-networking \
+            >/tmp/tailscaled.log 2>&1 &
+          # Bring node up
+          sudo -E tailscale up \
+            --reset \
+            --authkey="${TS_AUTHKEY}" \
+            --hostname="${HOSTNAME}" \
+            --ssh
           tailscale ip || true
 
       - name: "Connection info"
         shell: bash
         run: |
-          ts_ip4="$(tailscale ip -4 | head -n1 || echo N/A)"
+          set -eux
+          TS_IP4="$(tailscale ip -4 | head -n1 || echo N/A)"
           echo "===== CONNECTION INFO ====="
-          echo "Tailscale IPv4: ${ts_ip4}"
-          echo "User: ${USERNAME}"
-          echo "Password: (your workflow password)"
-          echo "VNC: ${ts_ip4}:5901 (display :1)"
+          echo "Tailscale IPv4 : ${TS_IP4}"
+          echo "VNC endpoint   : ${TS_IP4}:5901"
+          echo "VNC password   : ${VNC_PASSWORD}"
+          echo "Resolution     : ${RESOLUTION}"
+          echo "Viewer hint    : Use TigerVNC/RealVNC to ${TS_IP4}:5901"
           echo "==========================="
 
       - name: "Keep alive"
         shell: bash
         run: |
+          set -eux
           mins="${RUNTIME_MINUTES:-355}"
+          if ! [[ "$mins" =~ ^[0-9]+$ ]]; then mins=355; fi
+          [ "$mins" -gt 355 ] && mins=355
           echo "Keeping alive for ${mins} minutes..."
           for i in $(seq 1 "${mins}"); do
             echo "Minute $i / ${mins} - $(date -u +%F_%T)"
@@ -115,4 +105,5 @@ jobs:
         if: always()
         shell: bash
         run: |
-          sudo -u "${USERNAME}" vncserver -kill :1 || true
+          set -eux
+          docker rm -f desktop || true
