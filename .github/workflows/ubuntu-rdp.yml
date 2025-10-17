@@ -1,4 +1,4 @@
-name: GNOME + Tailscale + VNC & xRDP (No Secrets, Fixed)
+name: GNOME + Tailscale + VNC & xRDP (No Secrets, Fixed v2)
 
 on:
   workflow_dispatch:
@@ -54,10 +54,10 @@ jobs:
       HOSTNAME: gh-gnome-${{ github.run_id }}
 
     steps:
-      - name: Checkout
+      - name: "Checkout"
         uses: actions/checkout@v4
 
-      - name: Normalize/validate inputs
+      - name: "Normalize/validate inputs"
         id: cfg
         shell: bash
         run: |
@@ -94,7 +94,7 @@ jobs:
           if ! [[ "$geom" =~ ^[0-9]+x[0-9]+$ ]]; then geom="1366x768"; fi
           echo "vnc_geometry=$geom" >> "$GITHUB_OUTPUT"
 
-      - name: Prepare user and base desktop packages
+      - name: "Prepare user and base desktop packages"
         shell: bash
         run: |
           set -euxo pipefail
@@ -107,7 +107,7 @@ jobs:
             policykit-1 x11-xserver-utils fonts-dejavu-core
           sudo apt-get install -y curl jq net-tools psmisc lsof
 
-      - name: Install & configure xRDP (GNOME)
+      - name: "Install & configure xRDP (GNOME)"
         if: ${{ steps.cfg.outputs.enable_xrdp == 'true' }}
         shell: bash
         env:
@@ -136,7 +136,7 @@ EOSH
           sudo systemctl restart xrdp || true
           sudo systemctl --no-pager status xrdp || true
 
-      - name: Install & configure TigerVNC (GNOME)
+      - name: "Install & configure TigerVNC (GNOME)"
         if: ${{ steps.cfg.outputs.enable_vnc == 'true' }}
         shell: bash
         env:
@@ -167,7 +167,7 @@ EOSX
           sudo -u "${USER_LOGIN}" vncserver -kill ":${VNC_DISP}" || true
           sudo -u "${USER_LOGIN}" vncserver ":${VNC_DISP}" -geometry "${VNC_GEOM}" -localhost no
 
-      - name: Install & bring up Tailscale
+      - name: "Install & bring up Tailscale"
         shell: bash
         env:
           TSKEY: ${{ env.TS_AUTHKEY }}
@@ -179,7 +179,7 @@ EOSX
           sudo -E tailscale up --reset --authkey="${TSKEY}" --hostname="${HNAME}" --ssh
           tailscale ip || true
 
-      - name: Show connection info
+      - name: "Show connection info"
         id: info
         shell: bash
         env:
@@ -206,7 +206,7 @@ EOSX
             fi
           } | tee /tmp/connect.txt
 
-      - name: Keep alive for runtime
+      - name: "Keep alive for runtime"
         shell: bash
         env:
           KEEP_MIN: ${{ steps.cfg.outputs.runtime }}
@@ -218,7 +218,7 @@ EOSX
             sleep 60
           done
 
-      - name: Cleanup (stop VNC)
+      - name: "Cleanup (stop VNC)"
         if: ${{ always() && steps.cfg.outputs.enable_vnc == 'true' }}
         shell: bash
         env:
