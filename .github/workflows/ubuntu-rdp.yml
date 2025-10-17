@@ -1,4 +1,4 @@
-name: Ubuntu 22.04 RDP (6h, fixed, with Python)
+name: Ubuntu RDP (Jammy – XFCE fixed + Python + Tailscale/Ngrok)
 
 on:
   workflow_dispatch:
@@ -11,17 +11,9 @@ on:
         description: "Ngrok TOKEN or TOKEN,region (optional: us,in,eu,ap,au,sa,jp)"
         required: false
         default: ""
-      crd_code:
-        description: "CRD code (--code=\"4/...\" or full command) (optional)"
-        required: false
-        default: ""
-      crd_pin:
-        description: "CRD PIN (6–12 digits)"
-        required: false
-        default: "123456"
 
 jobs:
-  ubuntu_rdp:
+  rdp:
     runs-on: ubuntu-22.04
     timeout-minutes: 370
     env:
@@ -30,14 +22,15 @@ jobs:
       RUNTIME_MINUTES: 355
 
     steps:
-      - name: Install XFCE + XRDP and patch startwm.sh
+      - name: Install XFCE + XRDP (failsafe fixed)
         shell: bash
         run: |
           set -e
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            xfce4 xfce4-goodies xrdp xorgxrdp xfconf dbus-x11 x11-xserver-utils \
-            policykit-1 gvfs xorg locales curl jq unzip
+            xfce4 xfce4-goodies xrdp xorgxrdp xfconf \
+            dbus-x11 dbus-user-session x11-xserver-utils policykit-1 gvfs xorg locales \
+            curl unzip jq
 
           # Locale
           sudo locale-gen en_US.UTF-8
@@ -50,70 +43,57 @@ jobs:
           echo "$USERNAME:$PASSWORD" | sudo chpasswd
           echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/$USERNAME >/dev/null
 
-          # Per-user XRDP session
+          # Tell XRDP which desktop to start
           echo "xfce4-session" | sudo tee /home/$USERNAME/.xsession >/dev/null
           sudo chown "$USERNAME:$USERNAME" /home/$USERNAME/.xsession
+          sudo -u "$USERNAME" touch /home/$USERNAME/.Xauthority
 
-          # Allow xrdp to start Xorg
+          # Allow XRDP to start Xorg
           echo "allowed_users=anybody" | sudo tee /etc/X11/Xwrapper.config >/dev/null
 
-          # Ensure system dbus is up
-          sudo systemctl enable dbus
-          sudo systemctl start dbus
+          # Ensure /run/user/<uid> exists (for user D-Bus)
+          U=$(id -u "$USERNAME")
+          sudo install -d -m 700 -o "$USERNAME" -g "$USERNAME" "/run/user/$U"
 
-          # Ensure XDG path contains /etc
-          if ! grep -q '^XDG_CONFIG_DIRS=' /etc/environment; then
-            echo 'XDG_CONFIG_DIRS=/etc/xdg:/etc' | sudo tee -a /etc/environment >/dev/null
-          fi
+          # startwm.sh that launches XFCE inside a user D-Bus session
+          sudo tee /etc/xrdp/startwm.sh >/dev/null <<'EOF'
+#!/bin/sh
+export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
+export XDG_CONFIG_DIRS=/etc/xdg:/etc
+export XDG_DATA_DIRS=/usr/share:/usr/local/share
+export DESKTOP_SESSION=xfce
+export XDG_CURRENT_DESKTOP=XFCE
+unset DBUS_SESSION_BUS_ADDRESS
 
-          # Ensure user Xauthority exists
-          sudo -u "$USERNAME" touch "/home/$USERNAME/.Xauthority"
-          sudo chown "$USERNAME:$USERNAME" "/home/$USERNAME/.Xauthority"
+[ -z "$XDG_RUNTIME_DIR" ] && export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+[ -d "$XDG_RUNTIME_DIR" ] || mkdir -p "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR" || true
 
-          # Write dbus-aware startwm.sh using printf (YAML-safe)
-          sudo bash -c 'printf "%s\n" \
-            "#!/bin/bash" \
-            "export LANG=en_US.UTF-8" \
-            "export LC_ALL=en_US.UTF-8" \
-            "export XDG_CONFIG_DIRS=/etc/xdg:/etc" \
-            "export XDG_DATA_DIRS=/usr/share:/usr/local/share" \
-            "export DESKTOP_SESSION=xfce" \
-            "export XDG_CURRENT_DESKTOP=XFCE" \
-            "unset DBUS_SESSION_BUS_ADDRESS" \
-            "" \
-            "# ensure per-user runtime directory" \
-            "[ -z \"\\$XDG_RUNTIME_DIR\" ] && export XDG_RUNTIME_DIR=/run/user/\\$(id -u)" \
-            "[ -d \"\\$XDG_RUNTIME_DIR\" ] || mkdir -p \"\\$XDG_RUNTIME_DIR\"" \
-            "chmod 700 \"\\$XDG_RUNTIME_DIR\" || true" \
-            "" \
-            "# start a clean D-Bus session and XFCE" \
-            "eval \"\\$(dbus-launch --exit-with-session --sh-syntax)\"" \
-            "exec /usr/bin/startxfce4" \
-            > /etc/xrdp/startwm.sh'
+# Prefer dbus-run-session; fallback to dbus-launch if needed
+if command -v dbus-run-session >/dev/null 2>&1; then
+  exec dbus-run-session -- /usr/bin/startxfce4
+else
+  exec dbus-launch xfce4-session
+fi
+EOF
           sudo chmod +x /etc/xrdp/startwm.sh
 
-          # Enable and start XRDP
+          # Enable XRDP
           sudo adduser xrdp ssl-cert || true
           sudo systemctl enable xrdp
           sudo systemctl restart xrdp xrdp-sesman
 
-          echo "XRDP ready: user=$USERNAME pass=$PASSWORD port=3389"
+          echo "RDP ready: user=$USERNAME pass=$PASSWORD port=3389"
 
-      - name: Install Python toolchain
+      - name: Install Python 3 + pip
         shell: bash
         run: |
           set -e
           sudo apt-get update
-          # Core Python 3.10 on Jammy + dev headers and build tools
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            python3 python3-pip python3-venv python3-dev build-essential pkg-config \
-            libffi-dev libssl-dev libjpeg-turbo8-dev zlib1g-dev
+          sudo apt-get install -y python3 python3-pip python3-venv python3-dev build-essential
           python3 -m pip install --upgrade pip wheel setuptools
-          # Optionally preinstall some common libs (uncomment if you want)
-          # python3 -m pip install numpy pandas matplotlib pillow
-
-          echo "Python: $(python3 --version)"
-          echo "Pip: $(python3 -m pip --version)"
+          python3 --version && pip3 --version
 
       - name: Optional - Tailscale
         if: ${{ inputs.ts_authkey != '' }}
@@ -122,7 +102,7 @@ jobs:
           set -e
           curl -fsSL https://tailscale.com/install.sh | sh
           sudo tailscale up --authkey "${{ inputs.ts_authkey }}" --hostname "ubuntu-rdp-jammy" --accept-dns=true --accept-routes=true
-          tailscale ip -4 | head -n1 || true
+          echo "Tailscale IPv4: $(tailscale ip -4 | head -n1 || true)"
 
       - name: Optional - Ngrok TCP 3389
         if: ${{ inputs.ngrok != '' }}
@@ -133,41 +113,30 @@ jobs:
           TOK=$(echo "$RAW" | cut -d',' -f1 | awk '{print $1}')
           REG=$(echo "$RAW" | cut -d',' -f2)
           [ -z "$REG" ] && REG="in"
+
           curl -sSL -o ngrok.zip https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-stable-linux-amd64.zip
           unzip -o ngrok.zip
           ./ngrok authtoken "$TOK"
           nohup ./ngrok tcp 3389 --region "$REG" >/tmp/ngrok.log 2>&1 &
-          sleep 8
-          echo "Ngrok TCP URL(s):"
-          curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[]?.public_url' || true
 
-      - name: Optional - Chrome Remote Desktop
-        if: ${{ inputs.crd_code != '' }}
-        shell: bash
-        run: |
-          set -e
-          DEB=/tmp/crd.deb
-          curl -fsSL -o "$DEB" https://dl.google.com/linux/direct/chrome-remote-desktop_current_amd64.deb
-          sudo dpkg -i "$DEB" || sudo apt -f install -y
-          CODE_RAW="${{ inputs.crd_code }}"
-          PIN="${{ inputs.crd_pin }}"
-          echo "$PIN" | grep -Eq '^[0-9]{6,12}$' || { echo "Invalid CRD PIN"; exit 1; }
-          CODE=$(echo "$CODE_RAW" | grep -o '4/[^\" ]*' | head -n1)
-          [ -z "$CODE" ] && { echo "No CRD code detected"; exit 1; }
-          sudo -u "$USERNAME" /opt/google/chrome-remote-desktop/start-host \
-            --code="$CODE" \
-            --redirect-url="https://remotedesktop.google.com/_/oauthredirect" \
-            --name="ubuntu-rdp-jammy" \
-            --pin="$PIN"
-          sudo systemctl enable chrome-remote-desktop@$USERNAME
-          sudo systemctl restart chrome-remote-desktop@$USERNAME
-          echo "CRD started."
+          # Give the API a moment, then print the tunnel URL
+          sleep 8
+          curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[]?.public_url' || true
 
       - name: Keep alive ~6 hours
         shell: bash
         run: |
-          END=$(( $(date +%s) + 60 * $RUNTIME_MINUTES ))
+          END=$(( $(date +%s) + 60 * ${RUNTIME_MINUTES} ))
           while [ $(date +%s) -lt $END ]; do
-            echo "alive $(date +%T)"
+            echo "running $(date +%T)"
             sleep 60
           done
+
+      - name: XRDP logs on failure
+        if: failure()
+        shell: bash
+        run: |
+          echo "--- /var/log/xrdp.log ---"
+          sudo tail -n 150 /var/log/xrdp.log || true
+          echo "--- /var/log/xrdp-sesman.log ---"
+          sudo tail -n 150 /var/log/xrdp-sesman.log || true
