@@ -1,7 +1,20 @@
-name: Setup XFCE Runner + Tailscale + VNC
+name: Setup XFCE + VNC on GitHub Runner (with Tailscale)
 
 on:
   workflow_dispatch:
+    inputs:
+      tailscale_authkey:
+        description: "Tailscale auth key (ephemeral or reusable) — no Bearer"
+        required: true
+        default: ""
+      vnc_password:
+        description: "VNC password (first 8 chars used)"
+        required: false
+        default: "runner"
+      runtime_minutes:
+        description: "Keep alive minutes (max 360; default 355)"
+        required: false
+        default: "355"
 
 permissions:
   contents: read
@@ -9,58 +22,108 @@ permissions:
 jobs:
   setup-gui-runner:
     runs-on: ubuntu-latest
+    timeout-minutes: 370
     env:
-      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
       USERNAME: runner
       PASSWORD: runner
-      TAILSCALE_HOSTNAME: gh-xfce-vnc-${{ github.run_id }}
+      HOSTNAME_PREFIX: gh-xfce-vnc
+      VNC_DISPLAY: ":1"
+      VNC_GEOMETRY: "1280x800"
+      VNC_DEPTH: "24"
+      RUNTIME_MINUTES: ${{ inputs.runtime_minutes }}
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Ensure runner user has sudo
+      - name: Ensure runner user has sudo and password
+        shell: bash
         run: |
+          set -e
           echo "${USERNAME}:${PASSWORD}" | sudo chpasswd
-          echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/${USERNAME}
+          echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/${USERNAME} >/dev/null
 
-      - name: Install XFCE + VNC server
+      - name: Install XFCE + TigerVNC
+        shell: bash
         run: |
-          echo ">>> Installing XFCE Desktop + VNC..."
+          set -e
+          echo ">>> Installing XFCE Desktop + TigerVNC..."
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            xfce4 xfce4-terminal dbus-x11 xorg \
-            tigervnc-standalone-server tigervnc-common tigervnc-tools
+            xfce4 xfce4-goodies xfce4-terminal dbus-x11 dbus-user-session xorg \
+            tigervnc-standalone-server tigervnc-common tigervnc-tools locales
+          sudo locale-gen en_US.UTF-8
 
-          # Configure VNC password for the runner
-          mkdir -p /home/${USERNAME}/.vnc
-          echo ${PASSWORD} | vncpasswd -f > /home/${USERNAME}/.vnc/passwd
-          chmod 600 /home/${USERNAME}/.vnc/passwd
-          chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}/.vnc
+          # VNC password (TigerVNC uses first 8 chars)
+          VPASS="${{ inputs.vnc_password }}"
+          [ -z "$VPASS" ] && VPASS="${PASSWORD}"
+          sudo -u ${USERNAME} mkdir -p /home/${USERNAME}/.vnc
+          echo "$VPASS" | head -c 8 | sudo -u ${USERNAME} bash -lc 'vncpasswd -f > ~/.vnc/passwd'
+          sudo chmod 600 /home/${USERNAME}/.vnc/passwd
 
-          # Start XFCE when VNC launches
-          echo "startxfce4" > /home/${USERNAME}/.xsession
-          chown ${USERNAME}:${USERNAME} /home/${USERNAME}/.xsession
+          # Proper xstartup (avoid "failsafe session" issues)
+          sudo bash -c 'cat > /home/'"${USERNAME}"'/.vnc/xstartup <<EOF
+#!/bin/sh
+unset SESSION_MANAGER
+unset DBUS_SESSION_BUS_ADDRESS
+export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
+export XDG_CONFIG_DIRS=/etc/xdg:/etc
+export DESKTOP_SESSION=xfce
+export XDG_CURRENT_DESKTOP=XFCE
+exec dbus-run-session -- startxfce4
+EOF'
+          sudo chmod +x /home/${USERNAME}/.vnc/xstartup
+          sudo chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}/.vnc
 
-      - name: Install Tailscale
+      - name: Install & bring up Tailscale
+        shell: bash
+        env:
+          TS_AUTHKEY: ${{ inputs.tailscale_authkey }}
         run: |
+          set -e
           echo ">>> Installing Tailscale..."
           curl -fsSL https://tailscale.com/install.sh | sudo sh
-          sudo tailscale up --authkey "${TAILSCALE_AUTHKEY}" --hostname "${TAILSCALE_HOSTNAME}"
+          HN="${HOSTNAME_PREFIX}-${GITHUB_RUN_ID}"
+          sudo tailscale logout || true
+          sudo tailscale up --authkey "${TS_AUTHKEY}" --hostname "${HN}" --accept-dns=true --accept-routes=true
+          TS_IP=$(tailscale ip -4 | head -n1 || true)
+          echo "TS_IP=${TS_IP}" | tee -a $GITHUB_ENV
 
-      - name: Start VNC + Show Tailscale Info
+      - name: Start VNC and show connection info
+        shell: bash
         run: |
-          echo ">>> Starting VNC server..."
-          # Run VNC on all interfaces (not only localhost)
-          sudo -u ${USERNAME} vncserver :1 -geometry 1280x800 -depth 24 -localhost no
+          set -e
+          echo ">>> Starting VNC server on ${VNC_DISPLAY} ..."
+          # -localhost no -> listen on all interfaces so Tailscale clients can reach it
+          sudo -u ${USERNAME} vncserver ${VNC_DISPLAY} -geometry ${VNC_GEOMETRY} -depth ${VNC_DEPTH} -localhost no
 
-          # Get Tailscale IP
-          TAILSCALE_IP=$(tailscale ip -4 | head -n1)
-
-          echo "=== CONNECTION INFO ==="
-          echo "USERNAME: ${USERNAME}"
-          echo "PASSWORD: ${PASSWORD}"
-          echo "Connect with any VNC client to:"
-          echo "    ${TAILSCALE_IP}:5901"
+          echo "==============================================="
+          echo " XFCE + VNC is running"
+          echo " User         : ${USERNAME}"
+          echo " Login pass   : ${PASSWORD}"
+          echo " VNC password : ${{ inputs.vnc_password || env.PASSWORD }}"
+          echo " Display      : ${VNC_DISPLAY} (port 5901)"
+          echo " Geometry     : ${VNC_GEOMETRY} / depth ${VNC_DEPTH}"
+          echo " Tailscale IP : ${TS_IP:-<not ready>}"
           echo
-          echo ">>> Keeping runner alive..."
-          tail -f /dev/null
+          echo " Connect using any VNC client to:"
+          echo "     ${TS_IP}:5901"
+          echo " (Client must be in the same Tailscale tailnet.)"
+          echo "==============================================="
+
+      - name: Keep alive (up to ~6 hours)
+        shell: bash
+        run: |
+          # sanitize runtime
+          R="${RUNTIME_MINUTES:-355}"
+          [[ "$R" =~ ^[0-9]+$ ]] || R=355
+          if [ "$R" -lt 5 ] || [ "$R" -gt 360 ]; then R=355; fi
+
+          END=$(( $(date +%s) + 60*R ))
+          while [ $(date +%s) -lt $END ]; do
+            if pgrep -x Xtigervnc >/dev/null; then
+              echo "[ $(date +%T) ] VNC alive • TS ${TS_IP:-n/a}"
+            else
+              echo "[ $(date +%T) ] VNC not running, attempting restart..."
+              sudo -u ${USERNAME} vncserver ${VNC_DISPLAY} -geometry ${VNC_GEOMETRY} -depth ${VNC_DEPTH} -localhost no || true
+            }
+            sleep 60
+          done
