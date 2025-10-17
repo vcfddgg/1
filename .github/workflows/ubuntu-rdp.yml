@@ -8,11 +8,11 @@ on:
         required: true
         default: ""
       vnc_password:
-        description: "VNC password (first 8 chars used)"
+        description: "VNC password (first 8 chars used; default 'runner')"
         required: false
         default: "runner"
       runtime_minutes:
-        description: "Keep alive minutes (max 360; default 355)"
+        description: "Keep alive minutes (5–360; default 355)"
         required: false
         default: "355"
 
@@ -30,7 +30,6 @@ jobs:
       VNC_DISPLAY: ":1"
       VNC_GEOMETRY: "1280x800"
       VNC_DEPTH: "24"
-      RUNTIME_MINUTES: ${{ inputs.runtime_minutes }}
 
     steps:
       - name: Ensure runner user has sudo and password
@@ -44,34 +43,34 @@ jobs:
         shell: bash
         run: |
           set -e
-          echo ">>> Installing XFCE Desktop + TigerVNC..."
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             xfce4 xfce4-goodies xfce4-terminal dbus-x11 dbus-user-session xorg \
             tigervnc-standalone-server tigervnc-common tigervnc-tools locales
           sudo locale-gen en_US.UTF-8
 
-          # VNC password (TigerVNC uses first 8 chars)
+          # Set VNC password (TigerVNC uses first 8 chars)
           VPASS="${{ inputs.vnc_password }}"
-          [ -z "$VPASS" ] && VPASS="${PASSWORD}"
-          sudo -u ${USERNAME} mkdir -p /home/${USERNAME}/.vnc
-          echo "$VPASS" | head -c 8 | sudo -u ${USERNAME} bash -lc 'vncpasswd -f > ~/.vnc/passwd'
-          sudo chmod 600 /home/${USERNAME}/.vnc/passwd
+          if [ -z "$VPASS" ]; then VPASS="${PASSWORD}"; fi
+          sudo -u "${USERNAME}" mkdir -p "/home/${USERNAME}/.vnc"
+          printf "%s" "$VPASS" | head -c 8 | sudo -u "${USERNAME}" bash -lc 'vncpasswd -f > ~/.vnc/passwd'
+          sudo chmod 600 "/home/${USERNAME}/.vnc/passwd"
 
-          # Proper xstartup (avoid "failsafe session" issues)
-          sudo bash -c 'cat > /home/'"${USERNAME}"'/.vnc/xstartup <<EOF
-#!/bin/sh
-unset SESSION_MANAGER
-unset DBUS_SESSION_BUS_ADDRESS
-export LANG=en_US.UTF-8
-export LC_ALL=en_US.UTF-8
-export XDG_CONFIG_DIRS=/etc/xdg:/etc
-export DESKTOP_SESSION=xfce
-export XDG_CURRENT_DESKTOP=XFCE
-exec dbus-run-session -- startxfce4
-EOF'
-          sudo chmod +x /home/${USERNAME}/.vnc/xstartup
-          sudo chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}/.vnc
+          # Write xstartup without heredoc (YAML-safe)
+          sudo -u "${USERNAME}" mkdir -p "/home/${USERNAME}/.vnc"
+          sudo bash -c "printf '%s\n' \
+            '#!/bin/sh' \
+            'unset SESSION_MANAGER' \
+            'unset DBUS_SESSION_BUS_ADDRESS' \
+            'export LANG=en_US.UTF-8' \
+            'export LC_ALL=en_US.UTF-8' \
+            'export XDG_CONFIG_DIRS=/etc/xdg:/etc' \
+            'export DESKTOP_SESSION=xfce' \
+            'export XDG_CURRENT_DESKTOP=XFCE' \
+            'exec dbus-run-session -- startxfce4' \
+            > /home/${USERNAME}/.vnc/xstartup"
+          sudo chmod +x "/home/${USERNAME}/.vnc/xstartup"
+          sudo chown -R "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.vnc"
 
       - name: Install & bring up Tailscale
         shell: bash
@@ -79,51 +78,43 @@ EOF'
           TS_AUTHKEY: ${{ inputs.tailscale_authkey }}
         run: |
           set -e
-          echo ">>> Installing Tailscale..."
           curl -fsSL https://tailscale.com/install.sh | sudo sh
           HN="${HOSTNAME_PREFIX}-${GITHUB_RUN_ID}"
           sudo tailscale logout || true
           sudo tailscale up --authkey "${TS_AUTHKEY}" --hostname "${HN}" --accept-dns=true --accept-routes=true
           TS_IP=$(tailscale ip -4 | head -n1 || true)
-          echo "TS_IP=${TS_IP}" | tee -a $GITHUB_ENV
+          echo "TS_IP=${TS_IP}" >> "$GITHUB_ENV"
 
       - name: Start VNC and show connection info
         shell: bash
         run: |
           set -e
-          echo ">>> Starting VNC server on ${VNC_DISPLAY} ..."
-          # -localhost no -> listen on all interfaces so Tailscale clients can reach it
-          sudo -u ${USERNAME} vncserver ${VNC_DISPLAY} -geometry ${VNC_GEOMETRY} -depth ${VNC_DEPTH} -localhost no
-
+          sudo -u "${USERNAME}" vncserver "${VNC_DISPLAY}" -geometry "${VNC_GEOMETRY}" -depth "${VNC_DEPTH}" -localhost no
           echo "==============================================="
           echo " XFCE + VNC is running"
-          echo " User         : ${USERNAME}"
-          echo " Login pass   : ${PASSWORD}"
-          echo " VNC password : ${{ inputs.vnc_password || env.PASSWORD }}"
-          echo " Display      : ${VNC_DISPLAY} (port 5901)"
-          echo " Geometry     : ${VNC_GEOMETRY} / depth ${VNC_DEPTH}"
-          echo " Tailscale IP : ${TS_IP:-<not ready>}"
+          echo " Linux user     : ${USERNAME} / ${PASSWORD}"
+          echo " VNC password   : ${VNC_PASSWORD:-${{ inputs.vnc_password }}}"
+          echo " Display        : ${VNC_DISPLAY} (port 5901)"
+          echo " Geometry       : ${VNC_GEOMETRY} / depth ${VNC_DEPTH}"
+          echo " Tailscale IP   : ${TS_IP:-<not ready>}"
           echo
           echo " Connect using any VNC client to:"
-          echo "     ${TS_IP}:5901"
-          echo " (Client must be in the same Tailscale tailnet.)"
+          echo "     ${TS_IP}:5901   (client must be on same Tailscale tailnet)"
           echo "==============================================="
 
-      - name: Keep alive (up to ~6 hours)
+      - name: Keep alive
         shell: bash
         run: |
-          # sanitize runtime
-          R="${RUNTIME_MINUTES:-355}"
-          [[ "$R" =~ ^[0-9]+$ ]] || R=355
+          R="${{ inputs.runtime_minutes }}"
+          if ! echo "$R" | grep -Eq '^[0-9]+$'; then R=355; fi
           if [ "$R" -lt 5 ] || [ "$R" -gt 360 ]; then R=355; fi
-
           END=$(( $(date +%s) + 60*R ))
-          while [ $(date +%s) -lt $END ]; do
+          while [ "$(date +%s)" -lt "$END" ]; do
             if pgrep -x Xtigervnc >/dev/null; then
               echo "[ $(date +%T) ] VNC alive • TS ${TS_IP:-n/a}"
             else
-              echo "[ $(date +%T) ] VNC not running, attempting restart..."
-              sudo -u ${USERNAME} vncserver ${VNC_DISPLAY} -geometry ${VNC_GEOMETRY} -depth ${VNC_DEPTH} -localhost no || true
-            }
+              echo "[ $(date +%T) ] VNC not running, restarting..."
+              sudo -u "${USERNAME}" vncserver "${VNC_DISPLAY}" -geometry "${VNC_GEOMETRY}" -depth "${VNC_DEPTH}" -localhost no || true
+            fi
             sleep 60
           done
