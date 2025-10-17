@@ -43,7 +43,7 @@ jobs:
           echo "$USERNAME:$PASSWORD" | sudo chpasswd
           echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/$USERNAME >/dev/null
 
-          # Tell XRDP which desktop to start
+          # XRDP session selection for this user
           echo "xfce4-session" | sudo tee /home/$USERNAME/.xsession >/dev/null
           sudo chown "$USERNAME:$USERNAME" /home/$USERNAME/.xsession
           sudo -u "$USERNAME" touch /home/$USERNAME/.Xauthority
@@ -55,28 +55,25 @@ jobs:
           U=$(id -u "$USERNAME")
           sudo install -d -m 700 -o "$USERNAME" -g "$USERNAME" "/run/user/$U"
 
-          # startwm.sh that launches XFCE inside a user D-Bus session
-          sudo tee /etc/xrdp/startwm.sh >/dev/null <<'EOF'
-#!/bin/sh
-export LANG=en_US.UTF-8
-export LC_ALL=en_US.UTF-8
-export XDG_CONFIG_DIRS=/etc/xdg:/etc
-export XDG_DATA_DIRS=/usr/share:/usr/local/share
-export DESKTOP_SESSION=xfce
-export XDG_CURRENT_DESKTOP=XFCE
-unset DBUS_SESSION_BUS_ADDRESS
-
-[ -z "$XDG_RUNTIME_DIR" ] && export XDG_RUNTIME_DIR="/run/user/$(id -u)"
-[ -d "$XDG_RUNTIME_DIR" ] || mkdir -p "$XDG_RUNTIME_DIR"
-chmod 700 "$XDG_RUNTIME_DIR" || true
-
-# Prefer dbus-run-session; fallback to dbus-launch if needed
-if command -v dbus-run-session >/dev/null 2>&1; then
-  exec dbus-run-session -- /usr/bin/startxfce4
-else
-  exec dbus-launch xfce4-session
-fi
-EOF
+          # Write startwm.sh with printf (no heredoc = YAML-safe)
+          sudo bash -c 'printf "%s\n" \
+            "#!/bin/sh" \
+            "export LANG=en_US.UTF-8" \
+            "export LC_ALL=en_US.UTF-8" \
+            "export XDG_CONFIG_DIRS=/etc/xdg:/etc" \
+            "export XDG_DATA_DIRS=/usr/share:/usr/local/share" \
+            "export DESKTOP_SESSION=xfce" \
+            "export XDG_CURRENT_DESKTOP=XFCE" \
+            "unset DBUS_SESSION_BUS_ADDRESS" \
+            "[ -z \"\\$XDG_RUNTIME_DIR\" ] && export XDG_RUNTIME_DIR=/run/user/\\$(id -u)" \
+            "[ -d \"\\$XDG_RUNTIME_DIR\" ] || mkdir -p \"\\$XDG_RUNTIME_DIR\"" \
+            "chmod 700 \"\\$XDG_RUNTIME_DIR\" || true" \
+            "if command -v dbus-run-session >/dev/null 2>&1; then" \
+            "  exec dbus-run-session -- /usr/bin/startxfce4" \
+            "else" \
+            "  exec dbus-launch xfce4-session" \
+            "fi" \
+            > /etc/xrdp/startwm.sh'
           sudo chmod +x /etc/xrdp/startwm.sh
 
           # Enable XRDP
@@ -113,13 +110,10 @@ EOF
           TOK=$(echo "$RAW" | cut -d',' -f1 | awk '{print $1}')
           REG=$(echo "$RAW" | cut -d',' -f2)
           [ -z "$REG" ] && REG="in"
-
           curl -sSL -o ngrok.zip https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-stable-linux-amd64.zip
           unzip -o ngrok.zip
           ./ngrok authtoken "$TOK"
           nohup ./ngrok tcp 3389 --region "$REG" >/tmp/ngrok.log 2>&1 &
-
-          # Give the API a moment, then print the tunnel URL
           sleep 8
           curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[]?.public_url' || true
 
